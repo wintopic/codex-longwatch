@@ -12,6 +12,7 @@ static ACTIVE_ICON: AtomicU8 = AtomicU8::new(0);
 ///
 /// Finder uses the light ICNS declared in `Info.plist`; once the app is running,
 /// GPUI's appearance observer calls this function whenever the system theme changes.
+#[allow(unsafe_code)]
 pub fn sync_macos_app_icon(dark: bool, light_icns: &[u8], dark_icns: &[u8]) {
     let requested = if dark { DARK_ICON } else { LIGHT_ICON };
     if ACTIVE_ICON.load(Ordering::Acquire) == requested {

@@ -6,6 +6,7 @@ use thiserror::Error;
 ///
 /// Keep this independent from a personal GitHub handle so Windows never exposes
 /// a maintainer name when it falls back to displaying the raw application ID.
+#[cfg(target_os = "windows")]
 pub(crate) const APP_USER_MODEL_ID: &str = "Longwatch";
 
 #[derive(Debug, Error)]
@@ -131,6 +132,9 @@ fn set_registry_string(
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(clippy::unnecessary_wraps)]
 fn platform_initialize_app_identity() -> Result<(), IdentityError> {
+    // Keep the public API identical across platforms even though only Windows
+    // needs an explicit process identity registration step.
     Ok(())
 }

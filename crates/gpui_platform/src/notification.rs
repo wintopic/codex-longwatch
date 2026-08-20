@@ -295,7 +295,7 @@ fn platform_notify(
             .spawn(move || {
                 handle.wait_for_action(|selected| {
                     if selected == "open" || selected == "default" {
-                        action.open();
+                        let _ = action.open();
                     }
                 });
             })
