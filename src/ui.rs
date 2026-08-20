@@ -61,7 +61,8 @@ struct QueueView {
     config_directory: PathBuf,
     logs_directory: PathBuf,
     #[cfg(target_os = "macos")]
-    _appearance_subscription: Option<gpui::Subscription>,
+    #[allow(dead_code)] // Stored for its lifetime; dropping it stops theme-change callbacks.
+    appearance_subscription: Option<gpui::Subscription>,
 }
 
 impl QueueView {
@@ -1983,7 +1984,7 @@ pub fn run(
                                 config_directory,
                                 logs_directory,
                                 #[cfg(target_os = "macos")]
-                                _appearance_subscription: None,
+                                appearance_subscription: None,
                             });
                             let animated_view = view.clone();
                             let animated_closing = Arc::clone(&view_closing);
@@ -2041,7 +2042,7 @@ pub fn run(
                 #[cfg(target_os = "macos")]
                 {
                     sync_macos_icon_for_window(app_window);
-                    queue_view._appearance_subscription =
+                    queue_view.appearance_subscription =
                         Some(app_window.observe_window_appearance(|window, _| {
                             sync_macos_icon_for_window(window);
                         }));
