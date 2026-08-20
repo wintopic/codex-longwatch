@@ -1,0 +1,18 @@
+* text=auto
+
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+AppRun text eol=lf
+*.desktop text eol=lf
+*.plist text eol=lf
+*.rc text eol=lf
+*.iss text eol=lf
+*.ps1 text eol=lf
+
+*.png binary
+*.ico binary
+*.icns binary

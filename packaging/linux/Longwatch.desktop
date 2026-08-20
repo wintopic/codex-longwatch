@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Longwatch for Codex
+Comment=Stay with the task
+Exec=codex-longwatch
+Icon=codex-longwatch
+StartupWMClass=Longwatch
+Terminal=false
+Categories=Utility;Development;

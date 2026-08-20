@@ -1,0 +1,152 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: windows-x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: linux-x64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: macos-x64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact: macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev
+      - run: cargo build --locked --release --all-features --target ${{ matrix.target }}
+      - name: Package Windows portable archive and installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          if ("${{ github.ref_type }}" -eq "tag") { $version = "${{ github.ref_name }}" -replace '^v','' }
+          $stage = "dist/Longwatch-$version-${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/codex-longwatch.exe" $stage/
+          Copy-Item README.md $stage/
+          Copy-Item LICENSE $stage/
+          Compress-Archive -Path "$stage/*" -DestinationPath "Longwatch-$version-${{ matrix.artifact }}.zip"
+          choco install innosetup -y --no-progress
+          $env:LONGWATCH_VERSION = $version
+          $env:LONGWATCH_EXE = (Resolve-Path "target/${{ matrix.target }}/release/codex-longwatch.exe")
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging/windows/Longwatch.iss
+      - name: Package Linux tar.gz and AppImage
+        if: runner.os == 'Linux'
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "${{ github.ref_type }}" = "tag" ]; then version="${GITHUB_REF_NAME#v}"; fi
+          portable="Longwatch-$version-${{ matrix.artifact }}"
+          mkdir -p "dist/$portable"
+          cp target/${{ matrix.target }}/release/codex-longwatch "dist/$portable/"
+          cp README.md "dist/$portable/"
+          cp LICENSE "dist/$portable/"
+          tar -C dist -czf "$portable.tar.gz" "$portable"
+          mkdir -p Longwatch.AppDir/usr/bin Longwatch.AppDir/usr/share/applications Longwatch.AppDir/usr/share/icons/hicolor/1024x1024/apps
+          cp target/${{ matrix.target }}/release/codex-longwatch Longwatch.AppDir/usr/bin/
+          cp packaging/linux/AppRun Longwatch.AppDir/AppRun
+          chmod +x Longwatch.AppDir/AppRun Longwatch.AppDir/usr/bin/codex-longwatch
+          cp packaging/linux/Longwatch.desktop Longwatch.AppDir/Longwatch.desktop
+          cp packaging/icon.png Longwatch.AppDir/codex-longwatch.png
+          cp packaging/icon.png Longwatch.AppDir/usr/share/icons/hicolor/1024x1024/apps/codex-longwatch.png
+          curl -L -o appimagetool.AppImage https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool.AppImage
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool.AppImage Longwatch.AppDir "$portable.AppImage"
+          deb_root="dist/deb-root"
+          install -Dm755 target/${{ matrix.target }}/release/codex-longwatch "$deb_root/usr/bin/codex-longwatch"
+          install -Dm644 packaging/linux/Longwatch.desktop "$deb_root/usr/share/applications/codex-longwatch.desktop"
+          install -Dm644 packaging/icon.png "$deb_root/usr/share/icons/hicolor/1024x1024/apps/codex-longwatch.png"
+          install -Dm644 README.md "$deb_root/usr/share/doc/codex-longwatch/README.md"
+          install -Dm644 LICENSE "$deb_root/usr/share/doc/codex-longwatch/LICENSE"
+          mkdir -p "$deb_root/DEBIAN"
+          printf '%s\n' \
+            'Package: codex-longwatch' \
+            "Version: $version" \
+            'Section: devel' \
+            'Priority: optional' \
+            'Architecture: amd64' \
+            'Maintainer: Longwatch contributors <noreply@github.com>' \
+            'Depends: libfontconfig1, libx11-6, libxcb1, libxkbcommon0, libwayland-client0, libegl1, libgl1' \
+            'Description: Native desktop companion for long-running Codex tasks' \
+            > "$deb_root/DEBIAN/control"
+          dpkg-deb --build --root-owner-group "$deb_root" "$portable.deb"
+      - name: Package macOS DMG and portable application bundle
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x packaging/macos/build-app.sh
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "${{ github.ref_type }}" = "tag" ]; then version="${GITHUB_REF_NAME#v}"; fi
+          LONGWATCH_VERSION="$version" packaging/macos/build-app.sh "${{ matrix.target }}"
+          portable="Longwatch-$version-${{ matrix.artifact }}"
+          tar -C dist -czf "$portable.app.tar.gz" Longwatch.app
+          dmg_root="dist/dmg-root"
+          mkdir -p "$dmg_root"
+          cp -R dist/Longwatch.app "$dmg_root/"
+          ln -s /Applications "$dmg_root/Applications"
+          hdiutil create -volname "Longwatch for Codex" -srcfolder "$dmg_root" -ov -format UDZO "$portable.dmg"
+      - name: Generate SHA-256 checksums
+        shell: pwsh
+        run: |
+          $assets = Get-ChildItem -File | Where-Object { $_.Name -like 'Longwatch-*' -and $_.Name -notlike 'SHA256SUMS-*' }
+          $lines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset.FullName).Hash.ToLowerInvariant()
+            "$hash  $($asset.Name)"
+          }
+          $lines | Set-Content -Encoding utf8 "SHA256SUMS-${{ matrix.artifact }}.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Longwatch-${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            Longwatch-*.zip
+            Longwatch-*.tar.gz
+            Longwatch-*.AppImage
+            Longwatch-*.deb
+            Longwatch-*.dmg
+            Longwatch-*-setup.exe
+            SHA256SUMS-*.txt
+      - name: Upload release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Longwatch-*.zip
+            Longwatch-*.tar.gz
+            Longwatch-*.AppImage
+            Longwatch-*.deb
+            Longwatch-*.dmg
+            Longwatch-*-setup.exe
+            SHA256SUMS-*.txt
+          generate_release_notes: true

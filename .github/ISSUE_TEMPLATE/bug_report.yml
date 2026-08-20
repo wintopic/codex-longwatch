@@ -1,0 +1,85 @@
+name: Bug report
+description: Report a reproducible Longwatch problem
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Remove prompts, credentials, environment variables, personal paths, and other sensitive data before posting.
+  - type: input
+    id: version
+    attributes:
+      label: Longwatch version
+      placeholder: v0.3.0 or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: codex_version
+    attributes:
+      label: Codex CLI version
+      description: Output of `codex --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux X11
+        - Linux Wayland
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Active transport
+      options:
+        - Codex app-server
+        - GUI compatibility fallback
+        - Not connected / unknown
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Give a minimal sequence. Replace real task text with a harmless placeholder.
+      placeholder: |
+        1. Start Longwatch...
+        2. Submit placeholder task...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Paste the in-app support report or a short log excerpt only after reviewing and redacting it.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I removed prompts, credentials, environment variables, and personal paths.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

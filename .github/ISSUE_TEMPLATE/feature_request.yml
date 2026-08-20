@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a focused Longwatch improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem should Longwatch solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful solution.
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Reliability and privacy impact
+      description: Explain how this affects single-turn serialization, recovery, permissions, persisted data, or diagnostics.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

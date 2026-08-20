@@ -1,0 +1,100 @@
+[workspace]
+members = ["crates/gpui_platform"]
+resolver = "2"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+
+[package]
+name = "codex-longwatch"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "A native desktop companion that keeps Codex tasks moving until completion."
+repository = "https://github.com/wintopic/codex-longwatch"
+homepage = "https://github.com/wintopic/codex-longwatch"
+readme = "README.md"
+keywords = ["codex", "desktop", "queue", "retry", "gpui"]
+categories = ["development-tools", "gui"]
+
+[lib]
+name = "codex_longwatch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codex-longwatch"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "fake-codex-app-server"
+path = "tests/support/fake_app_server.rs"
+required-features = ["test-support"]
+
+[features]
+default = ["desktop", "gui-fallback"]
+desktop = []
+gui-fallback = ["gpui_platform/gui-fallback"]
+test-support = []
+
+[dependencies]
+anyhow = "1.0.98"
+async-trait = "0.1.88"
+chrono = { version = "0.4.41", features = ["clock", "serde"] }
+directories = "6.0.0"
+futures = "0.3.31"
+gpui_platform = { path = "crates/gpui_platform", version = "=0.1.0" }
+tdesign-gpui = { git = "https://github.com/wintopic/TDesign-GPUI.git", rev = "ba209322beedd37d0696f5815e9a8755cfb33bf1", default-features = true }
+notify = "6.1.1"
+rand = "0.9.1"
+rand_chacha = "0.9.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+single-instance = "0.3.3"
+tempfile = "3.20.0"
+thiserror = "2.0.12"
+tokio = { version = "1.45.1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "test-util", "time"] }
+tracing = "0.1.41"
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+unicode-segmentation = "1.12.0"
+uuid = { version = "1.16.0", features = ["serde", "v4"] }
+which = "7.0.3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["windows-manifest"] }
+raw-window-handle = "0.6.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui = { version = "=0.2.2", default-features = false, features = ["wayland", "x11"] }
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+
+[build-dependencies]
+embed-resource = "3.0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+too_many_lines = "allow"
