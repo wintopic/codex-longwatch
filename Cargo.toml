@@ -54,7 +54,7 @@ gpui_platform = { path = "crates/gpui_platform", version = "=0.1.0" }
 tdesign-gpui = { git = "https://github.com/wintopic/TDesign-GPUI.git", rev = "ba209322beedd37d0696f5815e9a8755cfb33bf1", default-features = true }
 notify = "6.1.1"
 rand = "0.9.1"
-rand_chacha = "0.9.0"
+rand_chacha = "0.10.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.9"
