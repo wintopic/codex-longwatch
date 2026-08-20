@@ -124,7 +124,7 @@ jobs:
             "$hash  $($asset.Name)"
           }
           $lines | Set-Content -Encoding utf8 "SHA256SUMS-${{ matrix.artifact }}.txt"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Longwatch-${{ matrix.artifact }}
           if-no-files-found: error
