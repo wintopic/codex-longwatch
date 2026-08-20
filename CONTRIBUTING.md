@@ -1,5 +1,8 @@
 # Contributing to Longwatch
 
+Participation in this project is governed by the
+[Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
+
 Thanks for helping make Longwatch safer and more dependable. Reliability changes are judged primarily by whether they preserve the core invariant: one persistent task may own at most one active Codex turn.
 
 ## Before opening an issue
