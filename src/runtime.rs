@@ -1141,25 +1141,18 @@ where
             if self.config.full_screen_flash_enabled {
                 gpui_platform::show_completion_overlay();
             }
-            let action = self
-                .machine
-                .snapshot()
-                .active_thread_id
-                .as_deref()
-                .map(|thread_id| {
-                    gpui_platform::NotificationAction::open_thread(
-                        thread_id,
-                        self.config.codex_path.to_string_lossy(),
-                    )
-                });
-            let notification_body = if action.is_some() {
-                "点击查看结果"
-            } else {
-                "已完成"
-            };
+            let snapshot = self.machine.snapshot();
+            let action = snapshot.active_thread_id.as_deref().map(|thread_id| {
+                gpui_platform::NotificationAction::open_thread(
+                    thread_id,
+                    self.config.codex_path.to_string_lossy(),
+                )
+            });
+            let notification_title = notification_preview(&self.config.prompt, 96);
+            let notification_body = notification_preview(&snapshot.reply_preview, 220);
             if let Err(error) = gpui_platform::notify_success(
-                "任务完成",
-                notification_body,
+                &notification_title,
+                &notification_body,
                 action.as_ref(),
                 self.config.audio_alert_enabled,
             ) {
@@ -1192,6 +1185,18 @@ fn error_conversation_text(error: &TurnError) -> String {
     }
 }
 
+fn notification_preview(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return "任务已完成".into();
+    }
+    let mut preview = normalized.chars().take(max_chars).collect::<String>();
+    if normalized.chars().count() > max_chars {
+        preview.push('…');
+    }
+    preview
+}
+
 async fn sleep_until(deadline: Option<TokioInstant>) {
     if let Some(deadline) = deadline {
         time::sleep_until(deadline).await;
@@ -1215,6 +1220,16 @@ mod tests {
         transport::{ThreadSession, TurnStatus},
     };
     use serde_json::json;
+
+    #[test]
+    fn notification_preview_matches_compact_chat_style() {
+        assert_eq!(
+            notification_preview("第一行\n\n第二行", 20),
+            "第一行 第二行"
+        );
+        assert_eq!(notification_preview("abcdef", 4), "abcd…");
+        assert_eq!(notification_preview("   ", 20), "任务已完成");
+    }
 
     #[derive(Debug, Default)]
     struct NoopTransport;

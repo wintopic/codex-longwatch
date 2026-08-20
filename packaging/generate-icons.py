@@ -13,6 +13,7 @@ PACKAGING = ROOT / "packaging"
 MARK_SOURCE = PACKAGING / "openai-mark.png"
 MASTER_SIZE = 1024
 UI_SIZE = 256
+TOAST_SIZE = 256
 RESAMPLE = Image.Resampling.LANCZOS
 
 
@@ -85,6 +86,19 @@ def save_icns(master: Image.Image, destination: Path) -> None:
     master.save(destination, format="ICNS", append_images=icns_images)
 
 
+def toast_mark(
+    alpha: Image.Image,
+    mark_color: tuple[int, int, int, int],
+) -> Image.Image:
+    canvas = Image.new("RGBA", (TOAST_SIZE, TOAST_SIZE), (0, 0, 0, 0))
+    fitted = fitted_alpha(alpha, 196)
+    mark = Image.new("RGBA", fitted.size, mark_color)
+    mark.putalpha(fitted)
+    position = ((TOAST_SIZE - fitted.width) // 2, (TOAST_SIZE - fitted.height) // 2)
+    canvas.alpha_composite(mark, position)
+    return canvas
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -115,6 +129,8 @@ def main() -> None:
     png_path = PACKAGING / "icon.png"
     ui_path = PACKAGING / "ui-logo.png"
     ico_path = PACKAGING / "windows" / "Longwatch.ico"
+    toast_light_path = PACKAGING / "windows" / "toast-light.png"
+    toast_dark_path = PACKAGING / "windows" / "toast-dark.png"
     light_icns_path = PACKAGING / "macos" / "Longwatch-Light.icns"
     dark_icns_path = PACKAGING / "macos" / "Longwatch-Dark.icns"
 
@@ -136,6 +152,12 @@ def main() -> None:
         ],
         bitmap_format="png",
     )
+    toast_mark(mark_alpha, (32, 33, 35, 255)).save(
+        toast_light_path, format="PNG", optimize=True
+    )
+    toast_mark(mark_alpha, (255, 255, 255, 255)).save(
+        toast_dark_path, format="PNG", optimize=True
+    )
     save_icns(master, light_icns_path)
     save_icns(macos_dark_master, dark_icns_path)
 
@@ -144,6 +166,8 @@ def main() -> None:
     print(f"Generated {png_path}")
     print(f"Generated {ui_path}")
     print(f"Generated {ico_path}")
+    print(f"Generated {toast_light_path}")
+    print(f"Generated {toast_dark_path}")
     print(f"Generated {light_icns_path}")
     print(f"Generated {dark_icns_path}")
 

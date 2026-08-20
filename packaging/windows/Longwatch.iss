@@ -36,8 +36,8 @@ Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Longwatch for Codex"; Filename: "{app}\codex-longwatch.exe"; WorkingDir: "{app}"; AppUserModelID: "Longwatch"
-Name: "{autodesktop}\Longwatch for Codex"; Filename: "{app}\codex-longwatch.exe"; WorkingDir: "{app}"; AppUserModelID: "Longwatch"; Tasks: desktopicon
+Name: "{group}\Longwatch for Codex"; Filename: "{app}\codex-longwatch.exe"; WorkingDir: "{app}"; AppUserModelID: "Longwatch.Codex"
+Name: "{autodesktop}\Longwatch for Codex"; Filename: "{app}\codex-longwatch.exe"; WorkingDir: "{app}"; AppUserModelID: "Longwatch.Codex"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked

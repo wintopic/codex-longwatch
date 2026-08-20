@@ -1,7 +1,9 @@
 //! `TDesign` GPUI desktop shell.
 
 use std::{
+    cell::Cell,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -12,9 +14,10 @@ use std::{
 #[cfg(target_os = "macos")]
 use gpui::WindowAppearance;
 use gpui::{
-    App, Application, Bounds, ClipboardItem, Context, Entity, FontWeight, Image, ImageFormat,
-    Render, ScrollHandle, Timer, TitlebarOptions, Window, WindowBounds, WindowControlArea,
-    WindowOptions, div, img, prelude::*, px, rgb, rgba, size,
+    Animation, AnimationExt as _, App, Application, Bounds, ClipboardItem, Context, Entity,
+    EntityInputHandler, FontWeight, Image, ImageFormat, MouseButton, Render, ScrollHandle, Timer,
+    TitlebarOptions, Transformation, Window, WindowBounds, WindowControlArea, WindowOptions, div,
+    img, percentage, prelude::*, px, relative, rgb, rgba, size, svg,
 };
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -46,13 +49,15 @@ struct QueueView {
     prompt_input: Entity<InputState>,
     cwd_input: Entity<InputState>,
     phrases_input: Entity<InputState>,
+    prompt_selection_anchor: Rc<Cell<Option<usize>>>,
+    cwd_selection_anchor: Rc<Cell<Option<usize>>>,
+    phrases_selection_anchor: Rc<Cell<Option<usize>>>,
     gui_fallback_toggle: Entity<ToggleState>,
     full_screen_toggle: Entity<ToggleState>,
     audio_toggle: Entity<ToggleState>,
     logo_image: Arc<Image>,
     codex_cli: CodexCliInfo,
     advanced_open: bool,
-    pulsing: bool,
     route_motion_frame: u8,
     prompt_error: bool,
     conversation_scroll: ScrollHandle,
@@ -201,12 +206,7 @@ impl QueueView {
         cx.notify();
     }
 
-    fn update_snapshot(
-        &mut self,
-        snapshot: QueueSnapshot,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn update_snapshot(&mut self, snapshot: QueueSnapshot, cx: &mut Context<Self>) {
         let conversation_changed = self.snapshot.reply_preview != snapshot.reply_preview
             || self.snapshot.status_message != snapshot.status_message
             || self.snapshot.phase != snapshot.phase;
@@ -217,8 +217,6 @@ impl QueueView {
             .retry_alert_count
             .saturating_sub(self.snapshot.retry_alert_count)
             .min(16);
-        let became_success =
-            self.snapshot.phase != QueuePhase::Success && snapshot.phase == QueuePhase::Success;
         if conversation_changed {
             self.copy_feedback = CopyFeedback::Idle;
         }
@@ -232,28 +230,6 @@ impl QueueView {
             for _ in 0..retry_alerts {
                 gpui_platform::show_retry_error_overlay();
             }
-        }
-        if became_success && !self.pulsing {
-            self.pulsing = true;
-            cx.spawn_in(window, async move |this, cx| {
-                for _ in 0..10 {
-                    Timer::after(Duration::from_millis(220)).await;
-                    if this
-                        .update_in(cx, |view, _, cx| {
-                            view.pulsing = !view.pulsing;
-                            cx.notify();
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                let _ = this.update_in(cx, |view, _, cx| {
-                    view.pulsing = false;
-                    cx.notify();
-                });
-            })
-            .detach();
         }
         cx.notify();
     }
@@ -277,11 +253,7 @@ impl Render for QueueView {
             QueuePhase::FatalError => ButtonVariant::Danger,
             _ => ButtonVariant::Primary,
         };
-        let phase_accent = if self.pulsing && self.snapshot.phase == QueuePhase::Success {
-            rgb(0x0b7f58)
-        } else {
-            phase_color(self.snapshot.phase)
-        };
+        let phase_accent = phase_color(self.snapshot.phase);
         let has_runtime_warning = self.snapshot.runtime_warning.is_some();
         let phase_detail = self.snapshot.runtime_warning.clone().unwrap_or_else(|| {
             phase_detail(
@@ -301,14 +273,15 @@ impl Render for QueueView {
         let compact = viewport.height < px(640.);
         let status_padding = if compact { 12. } else { 16. };
         let status_panel_height = if self.snapshot.phase == QueuePhase::Success {
-            if compact { 156. } else { 178. }
+            if compact { 166. } else { 184. }
         } else if compact {
-            128.
+            142.
         } else {
-            146.
+            158.
         };
-        let metrics_panel_height = 116.;
-        let bottom_panel_height = if compact { 104. } else { 138. };
+        let metrics_panel_height = if compact { 104. } else { 108. };
+        let bottom_panel_height = if compact { 128. } else { 156. };
+        let prompt_field_height = if compact { 52. } else { 78. };
         let side_by_side = viewport.width >= px(780.);
         let primary_button_width = if side_by_side { 104. } else { 116. };
         let stop_button_width = if side_by_side { 88. } else { 92. };
@@ -326,58 +299,68 @@ impl Render for QueueView {
         let start_handler = view_entity.clone();
         let secondary_handler = view_entity.clone();
         let settings_handler = view_entity.clone();
-        let primary_button = Button::new(primary_label)
-            .variant(primary_variant)
-            .size(ComponentSize::Large)
-            .on_click(move |_, window, app| {
-                let prompt = start_handler
-                    .read(app)
-                    .prompt_input
-                    .read(app)
-                    .value
-                    .to_string();
-                let cwd = start_handler
-                    .read(app)
-                    .cwd_input
-                    .read(app)
-                    .value
-                    .to_string();
-                let phrases = start_handler
-                    .read(app)
-                    .phrases_input
-                    .read(app)
-                    .value
-                    .to_string();
-                start_handler.update(app, |view, cx| {
-                    let _ = window;
-                    view.primary_action_now(prompt, cwd, phrases);
-                    cx.notify();
-                });
-            });
-        let secondary_button = Button::new(secondary_label)
-            .variant(if self.snapshot.phase == QueuePhase::Success {
-                ButtonVariant::Outline
-            } else {
-                ButtonVariant::Danger
-            })
-            .size(ComponentSize::Large)
-            .on_click(move |_, window, app| {
-                secondary_handler.update(app, |view, cx| {
-                    let _ = window;
-                    view.secondary_action_now();
-                    cx.notify();
-                });
-            });
-        let settings_button = Button::new("高级设置")
-            .variant(ButtonVariant::Outline)
-            .size(ComponentSize::Medium)
-            .icon(Icon::new(IconName::Setting))
-            .on_click(move |_, window, app| {
-                settings_handler.update(app, |view, cx| {
-                    let _ = window;
-                    view.toggle_advanced_now(cx);
-                });
-            });
+        let primary_button = rounded_button(
+            Button::new(primary_label)
+                .variant(primary_variant)
+                .size(ComponentSize::Large)
+                .on_click(move |_, window, app| {
+                    let prompt = start_handler
+                        .read(app)
+                        .prompt_input
+                        .read(app)
+                        .value
+                        .to_string();
+                    let cwd = start_handler
+                        .read(app)
+                        .cwd_input
+                        .read(app)
+                        .value
+                        .to_string();
+                    let phrases = start_handler
+                        .read(app)
+                        .phrases_input
+                        .read(app)
+                        .value
+                        .to_string();
+                    start_handler.update(app, |view, cx| {
+                        let _ = window;
+                        view.primary_action_now(prompt, cwd, phrases);
+                        cx.notify();
+                    });
+                }),
+            primary_variant,
+        );
+        let secondary_variant = if self.snapshot.phase == QueuePhase::Success {
+            ButtonVariant::Outline
+        } else {
+            ButtonVariant::Danger
+        };
+        let secondary_button = rounded_button(
+            Button::new(secondary_label)
+                .variant(secondary_variant)
+                .size(ComponentSize::Large)
+                .on_click(move |_, window, app| {
+                    secondary_handler.update(app, |view, cx| {
+                        let _ = window;
+                        view.secondary_action_now();
+                        cx.notify();
+                    });
+                }),
+            secondary_variant,
+        );
+        let settings_button = rounded_button(
+            Button::new("高级设置")
+                .variant(ButtonVariant::Outline)
+                .size(ComponentSize::Medium)
+                .icon(Icon::new(IconName::Setting))
+                .on_click(move |_, window, app| {
+                    settings_handler.update(app, |view, cx| {
+                        let _ = window;
+                        view.toggle_advanced_now(cx);
+                    });
+                }),
+            ButtonVariant::Outline,
+        );
 
         let gui_handler = view_entity.clone();
         let full_screen_handler = view_entity.clone();
@@ -397,14 +380,17 @@ impl Render for QueueView {
             });
 
         let logs_handler = view_entity.clone();
-        let open_logs_button = Button::new("打开日志目录")
-            .variant(ButtonVariant::Text)
-            .size(ComponentSize::Small)
-            .on_click(move |_, _, app| {
-                logs_handler.update(app, |view, _| view.open_logs_now());
-            });
+        let open_logs_button = rounded_button(
+            Button::new("打开日志目录")
+                .variant(ButtonVariant::Text)
+                .size(ComponentSize::Small)
+                .on_click(move |_, _, app| {
+                    logs_handler.update(app, |view, _| view.open_logs_now());
+                }),
+            ButtonVariant::Text,
+        );
         let diagnostics_handler = view_entity.clone();
-        let copy_diagnostics_button =
+        let copy_diagnostics_button = rounded_button(
             Button::new(if self.diagnostic_copy_feedback == CopyFeedback::Copied {
                 "已复制"
             } else {
@@ -416,7 +402,9 @@ impl Render for QueueView {
                 diagnostics_handler.update(app, |view, cx| {
                     view.copy_diagnostics(window, cx);
                 });
-            });
+            }),
+            ButtonVariant::Text,
+        );
         let diagnostic_actions = div()
             .flex()
             .items_center()
@@ -451,17 +439,20 @@ impl Render for QueueView {
             let assistant_text = conversation_text(&self.snapshot);
             let copy_text = assistant_text.clone();
             let copy_handler = view_entity.clone();
-            let copy_button = Button::new(if self.copy_feedback == CopyFeedback::Copied {
-                "已复制"
-            } else {
-                "复制"
-            })
-            .variant(ButtonVariant::Text)
-            .size(ComponentSize::Small)
-            .on_click(move |_, window, app| {
-                let text = copy_text.clone();
-                copy_handler.update(app, |view, cx| view.copy_reply(text, window, cx));
-            });
+            let copy_button = rounded_button(
+                Button::new(if self.copy_feedback == CopyFeedback::Copied {
+                    "已复制"
+                } else {
+                    "复制"
+                })
+                .variant(ButtonVariant::Text)
+                .size(ComponentSize::Small)
+                .on_click(move |_, window, app| {
+                    let text = copy_text.clone();
+                    copy_handler.update(app, |view, cx| view.copy_reply(text, window, cx));
+                }),
+                ButtonVariant::Text,
+            );
             let assistant_message = div().w_full().min_w(px(0.)).flex().items_start().child(
                 div()
                     .w_full()
@@ -588,17 +579,28 @@ impl Render for QueueView {
                     .flex_none()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_2()
                     .p_2()
                     .border_t_1()
                     .border_color(rgb(0xe7e7e7))
-                    .child(Textarea::new(self.prompt_input.clone()).rows(if compact {
-                        1
-                    } else {
-                        2
-                    }))
                     .child(
                         div()
+                            .h(px(prompt_field_height))
+                            .flex_none()
+                            .child(rounded_field(
+                                self.prompt_input.clone(),
+                                Rc::clone(&self.prompt_selection_anchor),
+                                Textarea::new(self.prompt_input.clone()).rows(if compact {
+                                    1
+                                } else {
+                                    2
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .h(px(40.))
+                            .flex_none()
                             .flex()
                             .items_center()
                             .gap_3()
@@ -666,7 +668,6 @@ impl Render for QueueView {
                     .flex_col()
                     .gap_3()
                     .p_3()
-                    .justify_center()
                     .child(
                         div()
                             .h(px(status_panel_height))
@@ -688,7 +689,7 @@ impl Render for QueueView {
                             .border_1()
                             .border_color(status_surface_border(self.snapshot.phase))
                             .when(self.snapshot.phase == QueuePhase::Success, |this| {
-                                this.child(success_status_texture(self.route_motion_frame))
+                                this.child(success_status_texture())
                             })
                             .child(
                                 div()
@@ -803,15 +804,18 @@ impl Render for QueueView {
 
         let advanced_view = if self.advanced_open {
             let close_handler = view_entity.clone();
-            let close_button = Button::new("关闭")
-                .variant(ButtonVariant::Text)
-                .size(ComponentSize::Medium)
-                .on_click(move |_, window, app| {
-                    close_handler.update(app, |view, cx| {
-                        let _ = window;
-                        view.toggle_advanced_now(cx);
-                    });
-                });
+            let close_button = rounded_button(
+                Button::new("关闭")
+                    .variant(ButtonVariant::Text)
+                    .size(ComponentSize::Medium)
+                    .on_click(move |_, window, app| {
+                        close_handler.update(app, |view, cx| {
+                            let _ = window;
+                            view.toggle_advanced_now(cx);
+                        });
+                    }),
+                ButtonVariant::Text,
+            );
             let fields = if viewport.width >= px(720.) {
                 div()
                     .flex()
@@ -824,7 +828,11 @@ impl Render for QueueView {
                             .flex_col()
                             .gap_2()
                             .child(label("工作目录（可选）"))
-                            .child(Input::new(self.cwd_input.clone())),
+                            .child(rounded_field(
+                                self.cwd_input.clone(),
+                                Rc::clone(&self.cwd_selection_anchor),
+                                Input::new(self.cwd_input.clone()),
+                            )),
                     )
                     .child(
                         div()
@@ -834,7 +842,11 @@ impl Render for QueueView {
                             .flex_col()
                             .gap_2()
                             .child(label("繁忙提示短语（用 | 分隔）"))
-                            .child(Input::new(self.phrases_input.clone())),
+                            .child(rounded_field(
+                                self.phrases_input.clone(),
+                                Rc::clone(&self.phrases_selection_anchor),
+                                Input::new(self.phrases_input.clone()),
+                            )),
                     )
             } else {
                 div()
@@ -842,9 +854,17 @@ impl Render for QueueView {
                     .flex_col()
                     .gap_3()
                     .child(label("工作目录（可选）"))
-                    .child(Input::new(self.cwd_input.clone()))
+                    .child(rounded_field(
+                        self.cwd_input.clone(),
+                        Rc::clone(&self.cwd_selection_anchor),
+                        Input::new(self.cwd_input.clone()),
+                    ))
                     .child(label("繁忙提示短语（用 | 分隔）"))
-                    .child(Input::new(self.phrases_input.clone()))
+                    .child(rounded_field(
+                        self.phrases_input.clone(),
+                        Rc::clone(&self.phrases_selection_anchor),
+                        Input::new(self.phrases_input.clone()),
+                    ))
             };
             div()
                 .absolute()
@@ -1030,7 +1050,30 @@ impl Render for QueueView {
             .child(advanced_view)
             .capture_key_down(move |event, window, app| {
                 let key = event.keystroke.key.as_str();
-                if event.keystroke.modifiers.secondary() && matches!(key, "enter" | "return") {
+                let is_enter = matches!(key, "enter" | "return");
+                let prompt_focused = keyboard_handler
+                    .read(app)
+                    .prompt_input
+                    .read(app)
+                    .focus_handle
+                    .is_focused(window);
+                let prompt_composing = keyboard_handler
+                    .read(app)
+                    .prompt_input
+                    .read(app)
+                    .marked_range()
+                    .is_some();
+                let advanced_open = keyboard_handler.read(app).advanced_open;
+                let plain_prompt_enter = is_enter
+                    && prompt_focused
+                    && !prompt_composing
+                    && !event.keystroke.modifiers.modified();
+                let shortcut_enter = is_enter
+                    && event.keystroke.modifiers.secondary()
+                    && !event.keystroke.modifiers.shift
+                    && !(prompt_focused && prompt_composing)
+                    && !advanced_open;
+                if plain_prompt_enter || shortcut_enter {
                     let active = matches!(
                         keyboard_handler.read(app).snapshot.phase,
                         QueuePhase::Connecting
@@ -1038,8 +1081,7 @@ impl Render for QueueView {
                             | QueuePhase::Waiting
                             | QueuePhase::Backoff
                     );
-                    let advanced_open = keyboard_handler.read(app).advanced_open;
-                    if !active && !advanced_open {
+                    if !active {
                         let prompt = keyboard_handler
                             .read(app)
                             .prompt_input
@@ -1063,7 +1105,6 @@ impl Render for QueueView {
                             cx.notify();
                         });
                     }
-                    let _ = window;
                     app.stop_propagation();
                 } else if key == "escape" && keyboard_handler.read(app).advanced_open {
                     keyboard_handler.update(app, |view, cx| {
@@ -1115,7 +1156,6 @@ fn titlebar(logo_image: Arc<Image>) -> gpui::Div {
                 ),
         )
         .child(titlebar_control("−", WindowControlArea::Min, false))
-        .child(titlebar_control("□", WindowControlArea::Max, false))
         .child(titlebar_control("×", WindowControlArea::Close, true))
 }
 
@@ -1350,6 +1390,117 @@ fn label(text: &'static str) -> impl IntoElement {
         .child(text)
 }
 
+/// `TDesign`'s stock controls use a compact radius internally. Clip them in a
+/// shared shell so buttons and fields follow the larger card radius used by
+/// the Longwatch surface without reimplementing their focus and keyboard
+/// behavior.
+fn rounded_button(child: impl IntoElement, variant: ButtonVariant) -> gpui::Div {
+    let background = match variant {
+        ButtonVariant::Primary | ButtonVariant::Success => rgb(0x16a673),
+        ButtonVariant::Warning => rgb(0xe37318),
+        ButtonVariant::Danger => rgb(0xd54941),
+        ButtonVariant::Outline | ButtonVariant::Base => rgb(0xffffff),
+        ButtonVariant::Text => rgba(0x00000000),
+    };
+    div()
+        .rounded_xl()
+        .overflow_hidden()
+        .bg(background)
+        .child(child)
+}
+
+fn rounded_field(
+    state: Entity<InputState>,
+    selection_anchor: Rc<Cell<Option<usize>>>,
+    child: impl IntoElement,
+) -> impl IntoElement {
+    let mouse_down_state = state.clone();
+    let mouse_down_anchor = Rc::clone(&selection_anchor);
+    let mouse_move_state = state.clone();
+    let mouse_move_anchor = Rc::clone(&selection_anchor);
+    let mouse_up_anchor = Rc::clone(&selection_anchor);
+    let mouse_up_out_anchor = selection_anchor;
+    div()
+        .id(("rounded-field", state.entity_id()))
+        .w_full()
+        .rounded_xl()
+        .overflow_hidden()
+        .cursor(gpui::CursorStyle::IBeam)
+        .border_1()
+        .border_color(rgb(0xdcdcdc))
+        .bg(rgb(0xffffff))
+        .child(child)
+        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+            if mouse_down_state.read(cx).disabled {
+                return;
+            }
+            mouse_down_state.read(cx).focus_handle.clone().focus(window);
+            let Some(offset) =
+                input_offset_for_point(&mouse_down_state, event.position, window, cx)
+            else {
+                return;
+            };
+            let anchor = if event.modifiers.shift {
+                mouse_down_state.read(cx).selection().start
+            } else {
+                offset
+            };
+            mouse_down_anchor.set(Some(anchor));
+            mouse_down_state.update(cx, |state, cx| {
+                state.set_selection(anchor..offset, cx);
+            });
+        })
+        .on_mouse_move(move |event, window, cx| {
+            if !event.dragging() {
+                return;
+            }
+            let Some(anchor) = mouse_move_anchor.get() else {
+                return;
+            };
+            let Some(offset) =
+                input_offset_for_point(&mouse_move_state, event.position, window, cx)
+            else {
+                return;
+            };
+            mouse_move_state.update(cx, |state, cx| {
+                state.set_selection(anchor..offset, cx);
+            });
+        })
+        .on_mouse_up(MouseButton::Left, move |_, _, _| {
+            mouse_up_anchor.set(None);
+        })
+        .on_mouse_up_out(MouseButton::Left, move |_, _, _| {
+            mouse_up_out_anchor.set(None);
+        })
+}
+
+fn input_offset_for_point(
+    state: &Entity<InputState>,
+    position: gpui::Point<gpui::Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<usize> {
+    state.update(cx, |state, cx| {
+        let utf16_offset = <InputState as EntityInputHandler>::character_index_for_point(
+            state, position, window, cx,
+        )?;
+        Some(utf16_offset_to_utf8(&state.value, utf16_offset))
+    })
+}
+
+fn utf16_offset_to_utf8(value: &str, utf16_offset: usize) -> usize {
+    let mut utf8_offset = 0;
+    let mut utf16_count = 0;
+    for character in value.chars() {
+        if utf16_count >= utf16_offset {
+            break;
+        }
+        utf16_count += character.len_utf16();
+        utf8_offset += character.len_utf8();
+    }
+    utf8_offset
+}
+
 fn status_icon(phase: QueuePhase, accent: gpui::Rgba) -> impl IntoElement {
     let (icon, size, frame_size) = match phase {
         QueuePhase::Success => (IconName::CheckCircleFilled, 64., 76.),
@@ -1360,6 +1511,27 @@ fn status_icon(phase: QueuePhase, accent: gpui::Rgba) -> impl IntoElement {
         QueuePhase::Paused => (IconName::PauseCircleFilled, 25., 40.),
         QueuePhase::FatalError => (IconName::ErrorCircleFilled, 25., 40.),
         QueuePhase::Idle => (IconName::ChevronRightCircle, 25., 40.),
+    };
+    let icon_element = if matches!(
+        phase,
+        QueuePhase::Connecting | QueuePhase::Sending | QueuePhase::Waiting | QueuePhase::Backoff
+    ) {
+        svg()
+            .path(icon.asset_path())
+            .w(px(size))
+            .h(px(size))
+            .text_color(accent)
+            .with_animation(
+                "processing-status-icon",
+                Animation::new(Duration::from_millis(1050)).repeat(),
+                |icon, delta| icon.with_transformation(Transformation::rotate(percentage(delta))),
+            )
+            .into_any_element()
+    } else {
+        Icon::new(icon)
+            .size(px(size))
+            .color(accent)
+            .into_any_element()
     };
     div()
         .w(px(frame_size))
@@ -1374,10 +1546,10 @@ fn status_icon(phase: QueuePhase, accent: gpui::Rgba) -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .child(Icon::new(icon).size(px(size)).color(accent))
+        .child(icon_element)
 }
 
-fn success_status_texture(motion_frame: u8) -> impl IntoElement {
+fn success_status_texture() -> impl IntoElement {
     const COLUMNS: usize = 15;
     const ROWS: usize = 5;
 
@@ -1387,49 +1559,113 @@ fn success_status_texture(motion_frame: u8) -> impl IntoElement {
         .left_0()
         .right_0()
         .bottom_0()
-        .children((0..COLUMNS * ROWS).map(move |index| {
-            let column = index % COLUMNS;
-            let row = index / COLUMNS;
-            let wave = (usize::from(motion_frame) + column * 3 + row * 5) % 16;
-            let alpha = match wave {
-                0 | 1 => 0x42,
-                2..=5 => 0x2e,
-                6..=10 => 0x22,
-                _ => 0x16,
-            };
-            let x = 24. + column as f32 * 28. + if row % 2 == 0 { 0. } else { 4. };
-            let y = 20. + row as f32 * 28.;
+        .child(
             div()
                 .absolute()
-                .left(px(x))
-                .top(px(y))
-                .w(px(3.))
-                .h(px(3.))
-                .rounded_full()
-                .bg(rgba(0x16a67300 | alpha))
-                .into_any_element()
-        }))
-        .child(success_confetti(motion_frame))
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .children((0..COLUMNS * ROWS).map(move |index| {
+                    let column = index % COLUMNS;
+                    let row = index / COLUMNS;
+                    let pattern = (column * 7 + row * 11) % 17;
+                    let alpha = match pattern {
+                        0 | 1 => 0x3a,
+                        2..=5 => 0x2a,
+                        6..=10 => 0x20,
+                        _ => 0x15,
+                    };
+                    let x = 24. + column as f32 * 28. + if row % 2 == 0 { 0. } else { 4. };
+                    let y = 20. + row as f32 * 28.;
+                    div()
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(3.))
+                        .h(px(3.))
+                        .rounded_full()
+                        .bg(rgba(0x16a67300 | alpha))
+                        .into_any_element()
+                }))
+                .with_animation(
+                    "success-dot-shimmer",
+                    Animation::new(Duration::from_millis(4200)).repeat(),
+                    |this, delta| {
+                        let shimmer = (delta * std::f32::consts::TAU).sin();
+                        this.opacity(0.78 + 0.12 * shimmer)
+                    },
+                ),
+        )
+        .child(success_confetti())
 }
 
-fn success_confetti(motion_frame: u8) -> impl IntoElement {
-    const PIECES: [(bool, f32, f32, f32, f32, u32); 14] = [
-        (false, 18., 5., 4., 13., 0x16a67300),
-        (false, 44., 29., 12., 4., 0xe0a32900),
-        (false, 76., 53., 5., 15., 0x39a99b00),
-        (false, 28., 82., 13., 4., 0xe36b5d00),
-        (false, 91., 105., 4., 12., 0x4f8dc900),
-        (false, 55., 132., 11., 4., 0x8e72c700),
-        (false, 112., 18., 4., 10., 0x16a67300),
-        (true, 20., 9., 12., 4., 0xe0a32900),
-        (true, 50., 35., 4., 14., 0x39a99b00),
-        (true, 82., 60., 13., 4., 0xe36b5d00),
-        (true, 31., 88., 5., 13., 0x4f8dc900),
-        (true, 96., 111., 11., 4., 0x16a67300),
-        (true, 60., 137., 4., 11., 0x8e72c700),
-        (true, 118., 20., 10., 4., 0xe0a32900),
+#[derive(Clone, Copy)]
+struct ConfettiPiece {
+    from_right: bool,
+    side: f32,
+    width: f32,
+    height: f32,
+    color: u32,
+    dot: bool,
+}
+
+impl ConfettiPiece {
+    const fn ribbon(from_right: bool, side: f32, width: f32, height: f32, color: u32) -> Self {
+        Self {
+            from_right,
+            side,
+            width,
+            height,
+            color,
+            dot: false,
+        }
+    }
+
+    const fn dot(from_right: bool, side_offset: f32, diameter: f32, color: u32) -> Self {
+        Self {
+            from_right,
+            side: side_offset,
+            width: diameter,
+            height: diameter,
+            color,
+            dot: true,
+        }
+    }
+}
+
+fn confetti_noise(index: usize, salt: usize) -> f32 {
+    let mixed = (index + 1) * (37 + salt * 12) + salt * 53 + index * index * 7;
+    (mixed % 101) as f32 / 100.
+}
+
+fn success_confetti() -> impl IntoElement {
+    const GREEN: u32 = 0x2f9c78;
+    const AMBER: u32 = 0xd7a13d;
+    const TEAL: u32 = 0x58aeb0;
+    const CORAL: u32 = 0xd87968;
+    const BLUE: u32 = 0x638fbd;
+    const PURPLE: u32 = 0x927bb8;
+    const PIECES: [ConfettiPiece; 18] = [
+        ConfettiPiece::ribbon(false, 19., 8., 3., GREEN),
+        ConfettiPiece::ribbon(true, 35., 3., 8., AMBER),
+        ConfettiPiece::dot(false, 61., 4., TEAL),
+        ConfettiPiece::ribbon(true, 78., 9., 3., CORAL),
+        ConfettiPiece::ribbon(false, 104., 3., 9., BLUE),
+        ConfettiPiece::ribbon(true, 126., 7., 3., PURPLE),
+        ConfettiPiece::dot(false, 137., 4., AMBER),
+        ConfettiPiece::ribbon(true, 18., 3., 7., GREEN),
+        ConfettiPiece::ribbon(false, 39., 9., 3., CORAL),
+        ConfettiPiece::dot(true, 55., 4., BLUE),
+        ConfettiPiece::ribbon(false, 82., 3., 8., PURPLE),
+        ConfettiPiece::ribbon(true, 101., 8., 3., TEAL),
+        ConfettiPiece::ribbon(false, 121., 7., 3., GREEN),
+        ConfettiPiece::ribbon(true, 143., 3., 9., AMBER),
+        ConfettiPiece::dot(false, 24., 4., PURPLE),
+        ConfettiPiece::ribbon(true, 67., 7., 3., CORAL),
+        ConfettiPiece::ribbon(false, 151., 3., 7., TEAL),
+        ConfettiPiece::dot(true, 116., 4., GREEN),
     ];
-    let frame = usize::from(motion_frame);
 
     div()
         .absolute()
@@ -1437,34 +1673,56 @@ fn success_confetti(motion_frame: u8) -> impl IntoElement {
         .left_0()
         .right_0()
         .bottom_0()
-        .children(PIECES.into_iter().enumerate().map(
-            move |(index, (from_right, side, top, width, height, color))| {
-                let drift = ((frame * 2 + index * 5) % 15) as f32;
-                let sway = match (frame + index * 3) % 8 {
-                    0 | 1 => 0.,
-                    2 | 3 | 7 => 2.,
-                    4 | 5 => 4.,
-                    _ => 3.,
-                };
-                let alpha = match (frame + index * 2) % 12 {
-                    0..=2 => 0x92,
-                    3..=6 => 0x78,
-                    7..=9 => 0x60,
-                    _ => 0x48,
-                };
+        .children(PIECES.into_iter().enumerate().map(|(index, piece)| {
+            let delay = 0.02 + 0.27 * confetti_noise(index, 0);
+            let start_y = -14. - 34. * confetti_noise(index, 1);
+            let fall_distance = 184. + 46. * confetti_noise(index, 2);
+            let drift = 12. * (confetti_noise(index, 3) * 2. - 1.);
+            let sway = 4. + 4. * confetti_noise(index, 4);
+            let sway_cycles = 1.45 + confetti_noise(index, 5);
+            let phase = std::f32::consts::TAU * confetti_noise(index, 6);
+            let max_opacity = 0.48 + 0.16 * confetti_noise(index, 7);
+            let duration_ms = 3300 + (850. * confetti_noise(index, 8)) as u64;
 
-                div()
-                    .absolute()
-                    .top(px(top + drift))
-                    .when(from_right, |this| this.right(px(side + sway)))
-                    .when(!from_right, |this| this.left(px(side + sway)))
-                    .w(px(width))
-                    .h(px(height))
-                    .rounded_full()
-                    .bg(rgba(color | alpha))
-                    .into_any_element()
-            },
-        ))
+            div()
+                .absolute()
+                .bg(rgb(piece.color))
+                .with_animation(
+                    ("success-confetti", index),
+                    Animation::new(Duration::from_millis(duration_ms)).repeat(),
+                    move |this, delta| {
+                        let progress = ((delta - delay) / (1. - delay)).clamp(0., 1.);
+                        let fall = 0.14 * progress + 0.86 * progress * progress;
+                        let wave = (phase + progress * sway_cycles * std::f32::consts::TAU).sin()
+                            - phase.sin();
+                        let side = (piece.side + drift * progress + sway * wave).max(8.);
+                        let fade_in = (progress / 0.07).clamp(0., 1.);
+                        let fade_out = ((1. - progress) / 0.22).clamp(0., 1.);
+                        let opacity = max_opacity * fade_in * fade_out;
+                        let flip = (phase * 1.7
+                            + progress * (sway_cycles + 1.4) * std::f32::consts::TAU)
+                            .cos()
+                            .abs();
+                        let visible_scale = 0.24 + 0.76 * flip;
+                        let (width, height) = if piece.dot {
+                            (piece.width, piece.height)
+                        } else if piece.width >= piece.height {
+                            (piece.width * visible_scale, piece.height)
+                        } else {
+                            (piece.width, piece.height * visible_scale)
+                        };
+
+                        this.top(px(start_y + fall_distance * fall))
+                            .when(piece.from_right, |this| this.right(px(side)))
+                            .when(!piece.from_right, |this| this.left(px(side)))
+                            .w(px(width.max(1.5)))
+                            .h(px(height.max(1.5)))
+                            .rounded(px(if piece.dot { 999. } else { 1.25 }))
+                            .opacity(opacity)
+                    },
+                )
+                .into_any_element()
+        }))
 }
 
 fn animated_attempt_route(
@@ -1474,7 +1732,7 @@ fn animated_attempt_route(
     accent: gpui::Rgba,
     motion_frame: u8,
 ) -> impl IntoElement {
-    let stage = match phase {
+    let stage: usize = match phase {
         QueuePhase::Connecting => 1,
         QueuePhase::Sending => 2,
         QueuePhase::Waiting | QueuePhase::Backoff => 3,
@@ -1487,6 +1745,7 @@ fn animated_attempt_route(
         QueuePhase::Connecting | QueuePhase::Sending | QueuePhase::Waiting | QueuePhase::Backoff
     );
     let pulse_on = running && motion_frame % 2 == 0;
+    let route_progress = stage as f32 / 4.;
 
     div()
         .size_full()
@@ -1520,132 +1779,122 @@ fn animated_attempt_route(
         .child(
             div()
                 .w_full()
+                .relative()
                 .flex()
-                .items_center()
-                .children((0..9).map(move |slot| {
-                    if slot % 2 == 1 {
-                        let connector = slot / 2;
-                        return div()
-                            .flex_1()
-                            .h(px(1.))
-                            .rounded_full()
-                            .bg(if connector < stage {
-                                accent
-                            } else {
-                                rgb(0xdde3e0)
-                            })
-                            .into_any_element();
-                    }
-
-                    let index = slot / 2;
-                    let completed = index < stage || (phase == QueuePhase::Success && index == 4);
-                    let current = index == stage;
-                    let dot_size = if current && pulse_on { 11. } else { 9. };
+                .child(
                     div()
-                        .w(px(14.))
-                        .h(px(14.))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
+                        .absolute()
+                        .left(relative(0.1))
+                        .right(relative(0.1))
+                        .top(px(6.5))
+                        .h(px(1.))
+                        .bg(rgb(0xdde3e0))
+                        .child(div().h_full().w(relative(route_progress)).bg(accent)),
+                )
+                .children(
+                    ["开始", "连接", "发送", "处理", "完成"]
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(index, label)| {
+                            let completed =
+                                index < stage || (phase == QueuePhase::Success && index == 4);
+                            let current = index == stage;
+                            let dot_size = if current && pulse_on { 11. } else { 9. };
                             div()
-                                .w(px(dot_size))
-                                .h(px(dot_size))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(if completed || current {
-                                    accent
-                                } else {
-                                    rgb(0xcbd3cf)
-                                })
-                                .bg(if completed || current {
-                                    accent
-                                } else {
-                                    rgb(0xffffff)
-                                }),
-                        )
-                        .into_any_element()
-                })),
-        )
-        .child(
-            div().w_full().flex().children(
-                ["开始", "连接", "发送", "处理", "完成"]
-                    .into_iter()
-                    .enumerate()
-                    .map(move |(index, label)| {
-                        div()
-                            .flex_1()
-                            .flex()
-                            .justify_center()
-                            .text_xs()
-                            .text_color(if index <= stage {
-                                accent
-                            } else {
-                                rgb(0x929a96)
-                            })
-                            .child(label)
-                    }),
-            ),
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .items_center()
+                                        .child(div().flex_1().h(px(1.)))
+                                        .child(
+                                            div()
+                                                .w(px(14.))
+                                                .h(px(14.))
+                                                .flex_none()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    div()
+                                                        .w(px(dot_size))
+                                                        .h(px(dot_size))
+                                                        .rounded_full()
+                                                        .border_1()
+                                                        .border_color(if completed || current {
+                                                            accent
+                                                        } else {
+                                                            rgb(0xcbd3cf)
+                                                        })
+                                                        .bg(if completed || current {
+                                                            accent
+                                                        } else {
+                                                            rgb(0xffffff)
+                                                        }),
+                                                ),
+                                        )
+                                        .child(div().flex_1().h(px(1.))),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if index <= stage {
+                                            accent
+                                        } else {
+                                            rgb(0x929a96)
+                                        })
+                                        .child(label),
+                                )
+                        }),
+                ),
         )
 }
 
+const ATTEMPT_GRID_ROWS: u64 = 5;
+const ATTEMPT_GRID_COLUMNS: u64 = 18;
+
+const fn attempt_grid_index(row: u64, column: u64) -> u64 {
+    row * ATTEMPT_GRID_COLUMNS + column
+}
+
 fn attempt_grid(attempt_count: u64, accent: gpui::Rgba) -> impl IntoElement {
-    const CELL_COUNT: u64 = 20;
+    const CELL_COUNT: u64 = ATTEMPT_GRID_ROWS * ATTEMPT_GRID_COLUMNS;
     let active_cells = attempt_count.min(CELL_COUNT);
-    let hidden_count = attempt_count.saturating_sub(CELL_COUNT);
     div()
         .w_full()
         .h_full()
         .flex()
-        .flex_col()
+        .items_center()
         .justify_center()
-        .gap_2()
-        .px_1()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(0x333333))
-                        .child("尝试轨迹"),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(0x777777))
-                        .child(format!("{attempt_count} 次")),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_1()
-                .children((0..CELL_COUNT).map(move |index| {
-                    let active = index < active_cells;
-                    div()
-                        .flex_1()
-                        .min_w(px(8.))
-                        .h(px(6.))
-                        .rounded_full()
-                        .bg(if active { accent } else { rgb(0xe4e8e6) })
-                })),
-        )
-        .when(hidden_count > 0, |this| {
-            this.child(
+        .child(div().w(px(428.)).h(px(116.)).flex().gap_1().children(
+            (0..ATTEMPT_GRID_COLUMNS).map(move |column| {
                 div()
-                    .text_xs()
-                    .text_color(rgb(0x777777))
-                    .child(format!("另有 {hidden_count} 次未展开显示")),
-            )
-        })
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children((0..ATTEMPT_GRID_ROWS).map(move |row| {
+                        // Fill a row from left to right before moving down.
+                        // This keeps early attempts distributed across the
+                        // whole panel instead of forming a dense block in
+                        // the first few columns.
+                        let index = attempt_grid_index(row, column);
+                        let active = index < active_cells;
+                        div()
+                            .w(px(20.))
+                            .h(px(20.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(if active { accent } else { rgb(0xdce2df) })
+                            .bg(if active { accent } else { rgb(0xe9eeeb) })
+                    }))
+            }),
+        ))
 }
 
 fn status_surface(phase: QueuePhase) -> gpui::Rgba {
@@ -1911,7 +2160,8 @@ pub fn run(
             tdesign_gpui::init(cx);
             let closing = Arc::new(AtomicBool::new(false));
             let titlebar_inset = if cfg!(target_os = "windows") { 32. } else { 0. };
-            let bounds = Bounds::centered(None, size(px(1000.), px(612. + titlebar_inset)), cx);
+            let window_size = size(px(1000.), px(612. + titlebar_inset));
+            let bounds = Bounds::centered(None, window_size, cx);
             #[cfg(target_os = "windows")]
             let initial_for_tray = snapshots.borrow().clone();
             let view_closing = Arc::clone(&closing);
@@ -1924,8 +2174,9 @@ pub fn run(
                             appears_transparent: cfg!(target_os = "windows"),
                             ..Default::default()
                         }),
-                        app_id: Some("Longwatch".into()),
-                        window_min_size: Some(size(px(780.), px(560. + titlebar_inset))),
+                        app_id: Some("Longwatch.Codex".into()),
+                        is_resizable: false,
+                        window_min_size: Some(window_size),
                         ..Default::default()
                     },
                     {
@@ -1969,13 +2220,15 @@ pub fn run(
                                 prompt_input,
                                 cwd_input,
                                 phrases_input,
+                                prompt_selection_anchor: Rc::new(Cell::new(None)),
+                                cwd_selection_anchor: Rc::new(Cell::new(None)),
+                                phrases_selection_anchor: Rc::new(Cell::new(None)),
                                 gui_fallback_toggle,
                                 full_screen_toggle,
                                 audio_toggle,
                                 logo_image,
                                 codex_cli,
                                 advanced_open: false,
-                                pulsing: false,
                                 route_motion_frame: 0,
                                 prompt_error: false,
                                 conversation_scroll: ScrollHandle::new(),
@@ -2018,7 +2271,6 @@ pub fn run(
                                                     | QueuePhase::Sending
                                                     | QueuePhase::Waiting
                                                     | QueuePhase::Backoff
-                                                    | QueuePhase::Success
                                             ) {
                                                 view.route_motion_frame =
                                                     view.route_motion_frame.wrapping_add(1);
@@ -2105,8 +2357,8 @@ pub fn run(
                     }
                     let snapshot = snapshots.borrow().clone();
                     if window
-                        .update(cx, |view, window, cx| {
-                            view.update_snapshot(snapshot, window, cx);
+                        .update(cx, |view, _, cx| {
+                            view.update_snapshot(snapshot, cx);
                         })
                         .is_err()
                     {
@@ -2129,15 +2381,19 @@ pub fn run(
     #[cfg(target_os = "windows")]
     gpui_platform::shutdown_tray();
 
-    let send_result = shutdown_runtime.block_on(runtime.send(RuntimeCommand::Shutdown));
-    if let Err(error) = send_result {
-        warn!(%error, "发送后台关闭命令失败");
-    }
-    match shutdown_runtime.block_on(tokio::time::timeout(Duration::from_secs(3), runtime.join())) {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "后台任务异常结束"),
-        Err(_) => warn!("等待后台任务退出超时"),
-    }
+    // Build timer-backed futures only after entering the Tokio runtime. Calling
+    // `tokio::time::timeout` as an eager `block_on` argument panics during app
+    // teardown because no reactor is active on GPUI's main thread.
+    shutdown_runtime.block_on(async move {
+        if let Err(error) = runtime.send(RuntimeCommand::Shutdown).await {
+            warn!(%error, "发送后台关闭命令失败");
+        }
+        match tokio::time::timeout(Duration::from_secs(3), runtime.join()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "后台任务异常结束"),
+            Err(_) => warn!("等待后台任务退出超时"),
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2186,5 +2442,27 @@ mod tests {
         let label = next_attempt_label_at(now + chrono::Duration::seconds(190), now);
 
         assert!(label.starts_with("约 3 分钟后"));
+    }
+
+    #[test]
+    fn utf16_pointer_offsets_land_on_utf8_character_boundaries() {
+        let value = "a你🙂b";
+
+        assert_eq!(utf16_offset_to_utf8(value, 0), 0);
+        assert_eq!(utf16_offset_to_utf8(value, 1), 1);
+        assert_eq!(utf16_offset_to_utf8(value, 2), 4);
+        assert_eq!(utf16_offset_to_utf8(value, 4), 8);
+        assert_eq!(utf16_offset_to_utf8(value, 5), value.len());
+    }
+
+    #[test]
+    fn attempt_grid_lights_one_cell_at_a_time_across_each_row() {
+        assert_eq!(attempt_grid_index(0, 0), 0);
+        assert_eq!(attempt_grid_index(0, 1), 1);
+        assert_eq!(
+            attempt_grid_index(0, ATTEMPT_GRID_COLUMNS - 1),
+            ATTEMPT_GRID_COLUMNS - 1
+        );
+        assert_eq!(attempt_grid_index(1, 0), ATTEMPT_GRID_COLUMNS);
     }
 }

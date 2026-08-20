@@ -84,6 +84,9 @@ fn show_windows_toast(
         core::{HSTRING, IInspectable},
     };
 
+    let icon_path = crate::identity::notification_icon_path().ok_or_else(|| {
+        NotificationError::Native("failed to prepare the Windows notification icon".into())
+    })?;
     let xml = windows_toast_xml(title, body, action, audio_enabled);
     let document =
         XmlDocument::new().map_err(|error| NotificationError::Native(error.to_string()))?;
@@ -126,11 +129,24 @@ fn show_windows_toast(
         crate::identity::APP_USER_MODEL_ID,
     ))
     .map_err(|error| NotificationError::Native(error.to_string()))?;
-    notifier
-        .Show(&toast)
-        .map_err(|error| NotificationError::Native(error.to_string()))?;
+    show_toast_with_icon_context(&notifier, &toast, Some(&icon_path))?;
     retain_windows_toast(toast);
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn show_toast_with_icon_context(
+    notifier: &windows::UI::Notifications::ToastNotifier,
+    toast: &windows::UI::Notifications::ToastNotification,
+    icon_path: Option<&std::path::Path>,
+) -> Result<(), NotificationError> {
+    notifier.Show(toast).map_err(|first_error| {
+        let detail = icon_path.map_or_else(
+            || "notification icon path unavailable".to_owned(),
+            |path| format!("notification icon path: {}", path.display()),
+        );
+        NotificationError::Native(format!("{first_error}; {detail}"))
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -146,36 +162,19 @@ fn retain_windows_toast(toast: windows::UI::Notifications::ToastNotification) {
 fn windows_toast_xml(
     title: &str,
     body: &str,
-    action: Option<&NotificationAction>,
+    _action: Option<&NotificationAction>,
     audio_enabled: bool,
 ) -> String {
     let title = escape_xml(title);
     let body = escape_xml(body);
     if audio_enabled {
-        let controls = action.map_or_else(
-            || {
-                "<commands scenario=\"alarm\"><command id=\"dismiss\"/></commands>".to_owned()
-            },
-            |action| {
-                format!(
-                    "<actions><action content=\"{}\" arguments=\"open-result\" activationType=\"foreground\"/></actions>",
-                    escape_xml(&action.label)
-                )
-            },
-        );
         return format!(
-            "<toast scenario=\"alarm\" duration=\"long\"><visual><binding template=\"ToastGeneric\"><text>{title}</text><text>{body}</text></binding></visual><audio src=\"ms-winsoundevent:Notification.Looping.Alarm\" loop=\"true\"/>{controls}</toast>"
+            "<toast scenario=\"alarm\" duration=\"long\"><visual><binding template=\"ToastGeneric\"><text hint-wrap=\"true\">{title}</text><text hint-wrap=\"true\">{body}</text></binding></visual><audio src=\"ms-winsoundevent:Notification.Looping.Alarm\" loop=\"true\"/><commands scenario=\"alarm\"><command id=\"dismiss\"/></commands></toast>"
         );
     }
 
-    let actions = action.map_or_else(String::new, |action| {
-        format!(
-            "<actions><action content=\"{}\" arguments=\"open-result\" activationType=\"foreground\"/></actions>",
-            escape_xml(&action.label),
-        )
-    });
     format!(
-        "<toast><visual><binding template=\"ToastGeneric\"><text>{title}</text><text>{body}</text></binding></visual><audio silent=\"true\"/>{actions}</toast>"
+        "<toast><visual><binding template=\"ToastGeneric\"><text hint-wrap=\"true\">{title}</text><text hint-wrap=\"true\">{body}</text></binding></visual><audio silent=\"true\"/></toast>"
     )
 }
 
@@ -201,9 +200,9 @@ mod windows_tests {
         assert!(xml.contains("duration=\"long\""));
         assert!(xml.contains("Notification.Looping.Alarm"));
         assert!(xml.contains("loop=\"true\""));
-        assert!(xml.contains("content=\"查看\""));
-        assert!(xml.contains("activationType=\"foreground\""));
-        assert!(xml.contains("arguments=\"open-result\""));
+        assert!(xml.contains("<command id=\"dismiss\"/>"));
+        assert!(!xml.contains("<actions>"));
+        assert!(!xml.contains("appLogoOverride"));
     }
 
     #[test]
@@ -218,14 +217,27 @@ mod windows_tests {
         let xml = windows_toast_xml("完成", "任务已完成", Some(&action), false);
         assert!(!xml.contains("scenario=\"alarm\""));
         assert!(xml.contains("audio silent=\"true\""));
-        assert!(xml.contains("activationType=\"foreground\""));
-        assert!(xml.contains("arguments=\"open-result\""));
+        assert!(!xml.contains("<actions>"));
+        assert!(!xml.contains("appLogoOverride"));
     }
 
     #[test]
     #[ignore = "shows a native looping Windows alarm toast for manual verification"]
     fn preview_windows_alarm_toast() {
         notify_success("任务完成", "已完成", None, true).unwrap();
+    }
+
+    #[test]
+    #[ignore = "shows a native silent Windows toast for manual header-icon verification"]
+    fn preview_windows_toast_header_icon() {
+        notify_success(
+            "整理项目文件并发布最新版本",
+            "已完成界面调整、测试与多平台发布配置。",
+            None,
+            false,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
     }
 }
 
