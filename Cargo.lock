@@ -2499,7 +2499,7 @@ dependencies = [
  "async-io",
  "atspi",
  "core-foundation 0.10.0",
- "core-graphics 0.24.0",
+ "core-graphics 0.25.0",
  "enigo",
  "mac-notification-sys",
  "macos-accessibility-client",
