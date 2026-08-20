@@ -313,14 +313,19 @@ async fn server_request_with_string_id_is_explicitly_rejected() {
         fake_transport("server_request_string_id").with_env("LONGWATCH_FAKE_LOG", log.as_os_str());
     transport.connect().await.unwrap();
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !log.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let response: serde_json::Value = serde_json::from_slice(&std::fs::read(log).unwrap()).unwrap();
+    let response: serde_json::Value =
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(&log)
+                    && let Ok(response) = serde_json::from_slice(&bytes)
+                {
+                    break response;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     assert_eq!(response["id"], "approval-request");
     assert_eq!(response["error"]["code"], -32601);
     transport.shutdown().await;
