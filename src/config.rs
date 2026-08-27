@@ -15,7 +15,7 @@ use tracing::warn;
 
 use crate::{
     backoff::{ABSOLUTE_MIN_INTERVAL_SECS, AttemptLedger, RetryPolicy},
-    queue::QueuePhase,
+    queue::{ConversationMessage, PendingMessage, QueuePhase},
 };
 
 pub const CONFIG_VERSION: u32 = 2;
@@ -25,13 +25,16 @@ pub const CURRENT_HIGH_DEMAND_PHRASE: &str =
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
+// These independent switches map directly to user-facing preferences.
+#[allow(clippy::struct_excessive_bools)]
 pub struct QueueConfig {
     pub version: u32,
     pub prompt: String,
+    pub default_prompt: String,
+    pub auto_send_default_prompt: bool,
     pub working_directory: Option<PathBuf>,
     pub codex_path: PathBuf,
     pub failure_phrases: Vec<String>,
-    pub gui_fallback_enabled: bool,
     pub full_screen_flash_enabled: bool,
     pub audio_alert_enabled: bool,
     pub retry_policy: RetryPolicy,
@@ -43,6 +46,8 @@ impl Default for QueueConfig {
         Self {
             version: CONFIG_VERSION,
             prompt: String::new(),
+            default_prompt: String::new(),
+            auto_send_default_prompt: false,
             working_directory: None,
             codex_path: PathBuf::from("codex"),
             failure_phrases: vec![
@@ -50,7 +55,6 @@ impl Default for QueueConfig {
                 "We're experiencing high demand. Please try again later.".into(),
                 CURRENT_HIGH_DEMAND_PHRASE.into(),
             ],
-            gui_fallback_enabled: false,
             full_screen_flash_enabled: true,
             audio_alert_enabled: true,
             retry_policy: RetryPolicy::default(),
@@ -61,12 +65,17 @@ impl Default for QueueConfig {
 
 impl QueueConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.retry_policy
-            .validate()
-            .map_err(ConfigError::RetryPolicy)?;
+        self.validate_settings()?;
         if self.prompt.trim().is_empty() {
             return Err(ConfigError::EmptyPrompt);
         }
+        Ok(())
+    }
+
+    pub fn validate_settings(&self) -> Result<(), ConfigError> {
+        self.retry_policy
+            .validate()
+            .map_err(ConfigError::RetryPolicy)?;
         if self.turn_timeout_secs < 60 {
             return Err(ConfigError::TurnTimeoutTooShort);
         }
@@ -88,6 +97,12 @@ pub struct PersistedQueueState {
     /// submitted twice.
     #[serde(default)]
     pub submission_uncertain: bool,
+    #[serde(default)]
+    pub queued_message: Option<PendingMessage>,
+    #[serde(default)]
+    pub conversation: Vec<ConversationMessage>,
+    #[serde(default)]
+    pub retry_as_follow_up: bool,
     pub attempt_count: u64,
     pub consecutive_retries: u32,
     /// Monotonic counter used by the UI to show one red full-screen pulse for
@@ -97,6 +112,9 @@ pub struct PersistedQueueState {
     pub empty_reply_count: u8,
     pub next_attempt_at: Option<DateTime<Utc>>,
     pub reply_preview: String,
+    /// Authoritative completion time copied from the Codex app-server turn.
+    #[serde(default)]
+    pub reply_completed_at: Option<DateTime<Utc>>,
     pub attempts: AttemptLedger,
     pub prompt_digest: Option<String>,
 }
@@ -110,12 +128,16 @@ impl Default for PersistedQueueState {
             active_thread_id: None,
             active_turn_id: None,
             submission_uncertain: false,
+            queued_message: None,
+            conversation: Vec::new(),
+            retry_as_follow_up: false,
             attempt_count: 0,
             consecutive_retries: 0,
             retry_alert_count: 0,
             empty_reply_count: 0,
             next_attempt_at: None,
             reply_preview: String::new(),
+            reply_completed_at: None,
             attempts: AttemptLedger::default(),
             prompt_digest: None,
         }
@@ -247,7 +269,11 @@ fn migrate_config(mut value: Value) -> Result<QueueConfig, ConfigError> {
         // Older releases exposed this as a preference. The app-server window
         // is now always hidden, so the legacy value is intentionally ignored.
         object.remove("hideAppServerWindow");
+        // GUI input fallback was removed; discard the old persisted switch so
+        // it cannot reappear when an older configuration is upgraded.
+        object.remove("guiFallbackEnabled");
         remove_legacy_attempt_limits(object);
+        migrate_default_prompt(object);
     }
     match version {
         0 => {
@@ -301,6 +327,17 @@ fn remove_legacy_attempt_limits(object: &mut serde_json::Map<String, Value>) {
     };
     policy.remove("maxAttemptsPerHour");
     policy.remove("maxAttemptsPerDay");
+}
+
+fn migrate_default_prompt(object: &mut serde_json::Map<String, Value>) {
+    if object.contains_key("defaultPrompt") {
+        return;
+    }
+    let prompt = object
+        .get("prompt")
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    object.insert("defaultPrompt".into(), prompt);
 }
 
 fn migrate_default_retry_delay(object: &mut serde_json::Map<String, Value>) {
@@ -451,6 +488,29 @@ mod tests {
     }
 
     #[test]
+    fn existing_prompt_becomes_the_initial_customizable_default() {
+        let migrated = migrate_config(json!({
+            "version": CONFIG_VERSION,
+            "prompt": "continue the task"
+        }))
+        .unwrap();
+
+        assert_eq!(migrated.default_prompt, "continue the task");
+    }
+
+    #[test]
+    fn settings_can_be_saved_before_the_first_task_is_entered() {
+        let config = QueueConfig {
+            default_prompt: "quick action".into(),
+            auto_send_default_prompt: true,
+            ..QueueConfig::default()
+        };
+
+        assert!(config.validate_settings().is_ok());
+        assert!(matches!(config.validate(), Err(ConfigError::EmptyPrompt)));
+    }
+
+    #[test]
     fn migrates_legacy_interval_and_clamps_it() {
         let migrated = migrate_config(json!({
             "prompt": "real task",
@@ -564,6 +624,23 @@ mod tests {
 
         assert!(policy.get("maxAttemptsPerHour").is_none());
         assert!(policy.get("maxAttemptsPerDay").is_none());
+    }
+
+    #[test]
+    fn migration_removes_the_retired_gui_fallback_setting() {
+        let migrated = migrate_config(json!({
+            "version": CONFIG_VERSION,
+            "prompt": "real task",
+            "guiFallbackEnabled": true
+        }))
+        .unwrap();
+
+        assert!(
+            serde_json::to_value(migrated)
+                .unwrap()
+                .get("guiFallbackEnabled")
+                .is_none()
+        );
     }
 
     #[test]

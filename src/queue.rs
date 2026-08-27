@@ -9,6 +9,33 @@ use crate::backoff::{AttemptLedger, RetryPolicy};
 use crate::config::PersistedQueueState;
 use crate::transport::TransportStatus;
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum ConversationRole {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationMessage {
+    pub role: ConversationRole,
+    pub content: String,
+    #[serde(default)]
+    pub automatic: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingMessage {
+    pub prompt: String,
+    #[serde(default)]
+    pub working_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub failure_phrases: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum QueuePhase {
@@ -48,6 +75,23 @@ pub struct QueueSnapshot {
     pub active_turn_id: Option<String>,
     #[serde(default)]
     pub submission_uncertain: bool,
+    /// The next message entered while a turn is running.  Longwatch keeps a
+    /// single pending message so typing ahead never loses the user's draft.
+    #[serde(default)]
+    pub queued_message: Option<PendingMessage>,
+    /// Messages exchanged during this Longwatch session.  This is local UI
+    /// history; the Codex thread remains the source of truth for context.
+    #[serde(default)]
+    pub conversation: Vec<ConversationMessage>,
+    /// When true, the next external attempt should ask Codex to continue the
+    /// existing work instead of submitting the original prompt again.
+    #[serde(default)]
+    pub retry_as_follow_up: bool,
+    /// Last user-submission command accepted by the runtime.  This is an
+    /// in-memory acknowledgement channel for the editor; it is intentionally
+    /// not part of the persisted queue state.
+    #[serde(default)]
+    pub accepted_request_id: u64,
     pub attempt_count: u64,
     pub consecutive_retries: u32,
     #[serde(default)]
@@ -55,6 +99,10 @@ pub struct QueueSnapshot {
     pub empty_reply_count: u8,
     pub next_attempt_at: Option<DateTime<Utc>>,
     pub reply_preview: String,
+    /// Completion time read from the original Codex turn. Longwatch only
+    /// caches this metadata for display and never writes it into the thread.
+    #[serde(default)]
+    pub reply_completed_at: Option<DateTime<Utc>>,
     pub codex_path: PathBuf,
     /// Ephemeral runtime warning shown in the UI. It is intentionally not
     /// persisted so a transient disk failure cannot become stale state after
@@ -75,12 +123,17 @@ impl Default for QueueSnapshot {
             active_thread_id: None,
             active_turn_id: None,
             submission_uncertain: false,
+            queued_message: None,
+            conversation: Vec::new(),
+            retry_as_follow_up: false,
+            accepted_request_id: 0,
             attempt_count: 0,
             consecutive_retries: 0,
             retry_alert_count: 0,
             empty_reply_count: 0,
             next_attempt_at: None,
             reply_preview: String::new(),
+            reply_completed_at: None,
             codex_path: PathBuf::from("codex"),
             runtime_warning: None,
             transport_status: TransportStatus::default(),
@@ -93,6 +146,8 @@ pub struct QueueMachine {
     snapshot: QueueSnapshot,
     attempts: AttemptLedger,
 }
+
+const MAX_CONVERSATION_MESSAGES: usize = 200;
 
 impl QueueMachine {
     #[must_use]
@@ -115,12 +170,17 @@ impl QueueMachine {
                 active_thread_id: state.active_thread_id,
                 active_turn_id: state.active_turn_id,
                 submission_uncertain: state.submission_uncertain,
+                queued_message: state.queued_message,
+                conversation: state.conversation,
+                retry_as_follow_up: state.retry_as_follow_up,
+                accepted_request_id: 0,
                 attempt_count: state.attempt_count,
                 consecutive_retries: state.consecutive_retries,
                 retry_alert_count: state.retry_alert_count,
                 empty_reply_count: state.empty_reply_count,
                 next_attempt_at: state.next_attempt_at,
                 reply_preview: state.reply_preview,
+                reply_completed_at: state.reply_completed_at,
                 codex_path,
                 runtime_warning: None,
                 transport_status: TransportStatus::default(),
@@ -143,12 +203,16 @@ impl QueueMachine {
             active_thread_id: self.snapshot.active_thread_id.clone(),
             active_turn_id: self.snapshot.active_turn_id.clone(),
             submission_uncertain: self.snapshot.submission_uncertain,
+            queued_message: self.snapshot.queued_message.clone(),
+            conversation: self.snapshot.conversation.clone(),
+            retry_as_follow_up: self.snapshot.retry_as_follow_up,
             attempt_count: self.snapshot.attempt_count,
             consecutive_retries: self.snapshot.consecutive_retries,
             retry_alert_count: self.snapshot.retry_alert_count,
             empty_reply_count: self.snapshot.empty_reply_count,
             next_attempt_at: self.snapshot.next_attempt_at,
             reply_preview: self.snapshot.reply_preview.clone(),
+            reply_completed_at: self.snapshot.reply_completed_at,
             attempts: self.attempts.clone(),
             prompt_digest,
         }
@@ -166,13 +230,85 @@ impl QueueMachine {
         self.snapshot.next_attempt_at = None;
     }
 
+    pub fn prepare_follow_up(&mut self) {
+        let active_thread_id = self.snapshot.active_thread_id.clone();
+        let codex_path = self.snapshot.codex_path.clone();
+        let runtime_warning = self.snapshot.runtime_warning.clone();
+        let transport_status = self.snapshot.transport_status.clone();
+        let conversation = self.snapshot.conversation.clone();
+        let queued_message = self.snapshot.queued_message.clone();
+        self.snapshot = QueueSnapshot {
+            status_message: "准备发送下一条消息".into(),
+            active_thread_id,
+            codex_path,
+            runtime_warning,
+            transport_status,
+            conversation,
+            queued_message,
+            retry_as_follow_up: false,
+            ..QueueSnapshot::default()
+        };
+        self.attempts = AttemptLedger::default();
+    }
+
+    pub fn clear_queued_message(&mut self) {
+        self.snapshot.queued_message = None;
+    }
+
+    pub fn acknowledge_request(&mut self, request_id: u64) {
+        self.snapshot.accepted_request_id = request_id;
+    }
+
+    pub fn set_queued_message(&mut self, message: PendingMessage) {
+        self.snapshot.queued_message = Some(message);
+    }
+
+    pub fn take_queued_message(&mut self) -> Option<PendingMessage> {
+        self.snapshot.queued_message.take()
+    }
+
+    pub fn append_conversation_message(
+        &mut self,
+        role: ConversationRole,
+        content: &str,
+        automatic: bool,
+    ) {
+        let content = content.trim();
+        if content.is_empty() {
+            return;
+        }
+        // A reconnect can replay the terminal event.  Avoid duplicating the
+        // exact same terminal message while still allowing repeated prompts.
+        if self
+            .snapshot
+            .conversation
+            .last()
+            .is_some_and(|last| last.role == role && last.content == content)
+        {
+            return;
+        }
+        self.snapshot.conversation.push(ConversationMessage {
+            role,
+            content: content.to_owned(),
+            automatic,
+        });
+        if self.snapshot.conversation.len() > MAX_CONVERSATION_MESSAGES {
+            let excess = self.snapshot.conversation.len() - MAX_CONVERSATION_MESSAGES;
+            self.snapshot.conversation.drain(..excess);
+        }
+    }
+
+    pub fn mark_retry_as_follow_up(&mut self) {
+        self.snapshot.retry_as_follow_up = true;
+    }
+
+    pub fn clear_retry_mode(&mut self) {
+        self.snapshot.retry_as_follow_up = false;
+    }
+
     pub fn set_thread(&mut self, thread_id: String) {
         self.snapshot.active_thread_id = Some(thread_id);
         self.snapshot.status_message = "线程已恢复，准备发送".into();
-    }
-
-    pub fn resolve_thread(&mut self, thread_id: String) {
-        self.snapshot.active_thread_id = Some(thread_id);
     }
 
     pub fn begin_sending(&mut self, now: DateTime<Utc>) -> Result<(), QueueError> {
@@ -185,6 +321,7 @@ impl QueueMachine {
         self.snapshot.status_message = "正在发送原始任务".into();
         self.snapshot.next_attempt_at = None;
         self.snapshot.reply_preview.clear();
+        self.snapshot.reply_completed_at = None;
         self.snapshot.submission_uncertain = false;
         Ok(())
     }
@@ -239,6 +376,10 @@ impl QueueMachine {
         } else {
             reply.to_owned()
         };
+    }
+
+    pub fn set_reply_completed_at(&mut self, completed_at: Option<DateTime<Utc>>) {
+        self.snapshot.reply_completed_at = completed_at;
     }
 
     pub fn set_status(&mut self, message: &str) {
@@ -366,6 +507,7 @@ impl QueueMachine {
         self.snapshot.next_attempt_at = None;
         self.snapshot.consecutive_retries = 0;
         self.snapshot.empty_reply_count = 0;
+        self.snapshot.retry_as_follow_up = false;
     }
 
     pub fn pause(&mut self, reason: &str) {
@@ -380,12 +522,24 @@ impl QueueMachine {
         self.snapshot.next_attempt_at = None;
     }
 
-    pub fn stop(&mut self) {
+    pub fn stop_current_turn(&mut self) {
+        self.prepare_follow_up();
+        self.snapshot.status_message = if self.snapshot.active_thread_id.is_some() {
+            "已停止；下次发送将继续当前会话".into()
+        } else {
+            "已停止；等待发送消息".into()
+        };
+    }
+
+    pub fn clear_session(&mut self) {
         self.snapshot = QueueSnapshot {
             codex_path: self.snapshot.codex_path.clone(),
-            status_message: "已停止；持久线程记录已清除".into(),
+            runtime_warning: self.snapshot.runtime_warning.clone(),
+            transport_status: self.snapshot.transport_status.clone(),
+            status_message: "等待任务".into(),
             ..QueueSnapshot::default()
         };
+        self.attempts = AttemptLedger::default();
     }
 }
 
@@ -453,5 +607,58 @@ mod tests {
         assert_eq!(machine.snapshot.next_attempt_at, Some(now));
         assert_eq!(machine.snapshot.retry_alert_count, 0);
         assert!(machine.snapshot.status_message.contains("立即重试"));
+    }
+
+    #[test]
+    fn stopping_a_turn_preserves_the_session_for_the_next_message() {
+        let mut machine = QueueMachine::new("codex".into());
+        machine.set_thread("thread-1".into());
+        machine.begin_sending(Utc::now()).unwrap();
+        machine.set_active_turn("turn-1".into()).unwrap();
+
+        machine.stop_current_turn();
+
+        assert_eq!(machine.snapshot.phase, QueuePhase::Idle);
+        assert_eq!(
+            machine.snapshot.active_thread_id.as_deref(),
+            Some("thread-1")
+        );
+        assert!(machine.snapshot.active_turn_id.is_none());
+        assert_eq!(machine.snapshot.attempt_count, 0);
+    }
+
+    #[test]
+    fn clearing_the_session_makes_the_next_launch_fresh() {
+        let mut machine = QueueMachine::new("codex".into());
+        machine.set_thread("thread-1".into());
+
+        machine.clear_session();
+
+        assert_eq!(machine.snapshot.phase, QueuePhase::Idle);
+        assert!(machine.snapshot.active_thread_id.is_none());
+    }
+
+    #[test]
+    fn one_pending_message_is_preserved_with_conversation_history() {
+        let mut machine = QueueMachine::new("codex".into());
+        machine.append_conversation_message(ConversationRole::User, "first", false);
+        machine.set_queued_message(PendingMessage {
+            prompt: "second".into(),
+            working_directory: None,
+            failure_phrases: vec!["busy".into()],
+        });
+
+        let state = machine.persisted(None);
+        let restored = QueueMachine::restore(state, "codex".into());
+
+        assert_eq!(restored.snapshot().conversation.len(), 1);
+        assert_eq!(
+            restored
+                .snapshot()
+                .queued_message
+                .as_ref()
+                .map(|message| message.prompt.as_str()),
+            Some("second")
+        );
     }
 }

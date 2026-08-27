@@ -7,8 +7,7 @@ use codex_longwatch::{
     app_server::AppServerTransport,
     config::ConfigStore,
     diagnostics,
-    runtime::spawn_runtime,
-    transport::{GuiFallbackTransport, PreferredTransport},
+    runtime::{prepare_startup_config, spawn_runtime},
     ui,
 };
 use single_instance::SingleInstance;
@@ -53,13 +52,10 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let config = store.load_config()?;
+    let mut config = store.load_config()?;
     let state = store.load_state()?;
-    let transport = PreferredTransport::new(
-        AppServerTransport::new(config.codex_path.clone()).with_hidden_window(true),
-        GuiFallbackTransport::new(config.gui_fallback_enabled),
-        config.gui_fallback_enabled,
-    );
+    let startup_auto_sent = prepare_startup_config(&mut config, &state);
+    let transport = AppServerTransport::new(config.codex_path.clone()).with_hidden_window(true);
     let tokio_runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -69,7 +65,12 @@ fn run() -> Result<()> {
     );
     let runtime = tokio_runtime
         .block_on(async { spawn_runtime(transport, config.clone(), state, Some(store.clone())) });
-    ui::run(config, runtime, Arc::clone(&tokio_runtime));
+    ui::run(
+        config,
+        runtime,
+        Arc::clone(&tokio_runtime),
+        startup_auto_sent,
+    );
     info!("Longwatch 已正常退出");
     drop(instance);
     Ok(())

@@ -43,7 +43,6 @@ It does **not** generate filler prompts, rotate accounts, bypass limits, or run 
 - **Codex-aware outcomes.** Overload responses, selected HTTP failures, stream loss, empty replies, internal retries, authentication failures, and policy errors are handled differently.
 - **Sleep-safe scheduling.** After system resume, Longwatch waits at least 60 seconds and never performs a burst of missed retries.
 - **Native desktop experience.** GPUI interface, native notifications, Windows tray controls, deep-link/CLI result opening, and privacy-conscious diagnostics.
-- **Explicit compatibility fallback.** Accessibility-driven GUI submission is available only when the user enables it; it never activates silently.
 - **Cross-platform releases.** GitHub Actions builds a Windows installer and portable ZIP, Linux DEB/AppImage/tarball, and macOS DMG/portable app bundles for Intel and Apple Silicon.
 - **Theme-aware macOS icon.** The running Dock icon switches between white/dark-mark and dark/white-mark variants with the system appearance.
 
@@ -133,12 +132,8 @@ GPUI / TDesign shell
         ▼
 QueueRuntime ── QueueMachine ── Retry classifier / wake detector
         │
-        ├── Codex app-server transport (default)
-        │      └── stdio JSON-RPC + persistent thread reconciliation
-        │
-        └── GUI compatibility transport (explicit opt-in)
-               ├── OS accessibility submission
-               └── incremental Codex session JSONL observation
+        └── Codex app-server transport
+               └── stdio JSON-RPC + persistent thread reconciliation
 
 Platform facade: notifications · tray · result opening · alerts · diagnostics
 Persistence: atomic config/state JSON · daily logs · crash reports
@@ -152,7 +147,6 @@ Persistence: atomic config/state JSON · daily logs · crash reports
 | `src/classifier.rs` | Retry, pause, and success classification |
 | `src/backoff.rs` | Bounded backoff, jitter, attempt ledger, and wake detection |
 | `src/config.rs` | Versioned config/state documents, migration, atomic writes |
-| `src/gui_fallback.rs` / `src/jsonl.rs` | Explicit GUI fallback and incremental session observation |
 | `src/ui.rs` | Native GPUI desktop interface |
 | `crates/gpui_platform` | OS-specific notifications, tray, automation boundary, and icon behavior |
 
@@ -201,17 +195,9 @@ Linux development additionally needs Fontconfig, X11/XCB, Wayland, EGL, and Open
 4. Leave Longwatch running; it will keep the thread serialized and wait through retryable failures.
 5. Open the result from the completion notification, the app, or the Windows tray menu.
 
-During an active task, task text and retry parameters are locked. Alert settings and the explicit GUI fallback switch can still be changed live. Use **Pause** to interrupt the active turn while keeping recoverable state, or **Stop** to clear the persisted Longwatch thread association.
+Advanced settings include a **Startup default message** that is placed in the composer on each fresh launch. Enable **Send after launch** to submit that non-empty message once automatically. While Longwatch stays open, subsequent messages reuse the same Codex conversation.
 
-## GUI compatibility fallback
-
-The fallback is disabled by default and is only attempted after an explicit opt-in.
-
-- **Windows:** UI Automation finds the Codex input, temporarily uses the clipboard, submits once, then restores clipboard text.
-- **macOS:** Accessibility permission is requested before locating and submitting to the Codex input.
-- **Linux:** AT-SPI plus one X11 Return event; Wayland sessions, including XWayland, are deliberately rejected for global input injection.
-
-Completion is observed from new records in `CODEX_HOME/sessions/**/*.jsonl`. Existing file offsets are baselined first, partial lines and rotation are handled, and duplicate event IDs are ignored. The fallback cannot reliably change Codex's working directory, so it refuses tasks that request one.
+During an active task, task text and retry parameters are locked. Alert settings can still be changed live. **Pause** interrupts the current turn while keeping recoverable state. **Stop** only interrupts the current turn and keeps the conversation, so the next message continues that thread. A normal application exit clears the session association; the next launch starts fresh.
 
 ## Privacy and safety
 
@@ -220,7 +206,6 @@ Completion is observed from new records in `CODEX_HOME/sessions/**/*.jsonl`. Exi
 - It does not read, request, or store API keys.
 - It does not include a WebView, Node runtime, local HTTP server, remote-control service, telemetry client, or account switcher.
 - The support report deliberately excludes task text, configuration files, environment variables, and credentials. It can include app/system versions, queue metadata, thread ID, a bounded reply/error preview, and recent Longwatch logs.
-- GUI automation is opt-in and bounded by platform accessibility APIs. On Windows, only textual clipboard data is preserved by the fallback.
 
 Review the local `config.json` and logs before sharing them publicly; they can contain your task text, working directory, and operational details.
 

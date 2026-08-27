@@ -21,7 +21,9 @@ use crate::{
         classify_turn_completion,
     },
     config::{ConfigStore, QueueConfig, prompt_digest},
-    queue::{QueueError, QueueMachine, QueuePhase, QueueSnapshot},
+    queue::{
+        ConversationRole, PendingMessage, QueueError, QueueMachine, QueuePhase, QueueSnapshot,
+    },
     transport::{
         CodexTransport, RestoredTurn, StartedTurn, ThreadSession, TransportError, TransportEvent,
         TurnStatus,
@@ -32,7 +34,21 @@ use crate::{
 pub enum RuntimeCommand {
     Configure(QueueConfig),
     StartConfigured(QueueConfig),
+    /// Same as `StartConfigured`, with an editor acknowledgement token.
+    SubmitConfigured {
+        config: QueueConfig,
+        request_id: u64,
+    },
     Start,
+    /// Resume the existing thread/task without treating the editor contents
+    /// as a new user message.  This is used by the tray and paused-state UI.
+    Resume,
+    /// Keep one message ready for automatic delivery after the active turn.
+    QueueMessage(PendingMessage),
+    QueueMessageWithAck {
+        message: PendingMessage,
+        request_id: u64,
+    },
     Pause,
     Stop,
     Wake,
@@ -97,15 +113,35 @@ impl RuntimeHandle {
 }
 
 /// Spawn a runtime on the current Tokio runtime.
+pub fn prepare_startup_config(
+    config: &mut QueueConfig,
+    state: &crate::config::PersistedQueueState,
+) -> bool {
+    let active_phase = matches!(
+        state.phase,
+        QueuePhase::Connecting | QueuePhase::Sending | QueuePhase::Waiting | QueuePhase::Backoff
+    );
+    let should_auto_send = !active_phase
+        && state.phase == QueuePhase::Idle
+        && state.active_thread_id.is_none()
+        && config.auto_send_default_prompt
+        && !config.default_prompt.trim().is_empty();
+    if should_auto_send {
+        config.prompt = config.default_prompt.clone();
+    }
+    should_auto_send
+}
+
 pub fn spawn_runtime<T>(
     transport: T,
-    config: QueueConfig,
+    mut config: QueueConfig,
     state: crate::config::PersistedQueueState,
     store: Option<ConfigStore>,
 ) -> RuntimeHandle
 where
     T: CodexTransport + 'static,
 {
+    let auto_start_default = prepare_startup_config(&mut config, &state);
     let active_phase = matches!(
         state.phase,
         QueuePhase::Connecting | QueuePhase::Sending | QueuePhase::Waiting | QueuePhase::Backoff
@@ -129,7 +165,10 @@ where
     let mut runtime = QueueRuntime::new(transport, config, machine, store, snapshot_sender);
     // A persisted active task is resumed automatically.  Paused, successful,
     // and fatal states remain user-controlled and never start on their own.
-    runtime.started = active_phase && prompt_matches;
+    if auto_start_default {
+        runtime.persist_config();
+    }
+    runtime.started = (active_phase && prompt_matches) || auto_start_default;
     let join = tokio::spawn(async move { runtime.run(command_receiver).await });
     RuntimeHandle {
         commands,
@@ -140,6 +179,7 @@ where
 
 /// The deterministic controller.  It is public so integration tests can use a
 /// fake app-server without opening a desktop window.
+#[allow(clippy::struct_excessive_bools)]
 pub struct QueueRuntime<T> {
     transport: T,
     config: QueueConfig,
@@ -153,6 +193,9 @@ pub struct QueueRuntime<T> {
     connection_failures: u32,
     turn_deadline: Option<Instant>,
     success_notified: bool,
+    /// Whether the logical user message for `config.prompt` is already in the
+    /// local conversation history.  Retries must not add duplicate bubbles.
+    current_prompt_recorded: bool,
     persistence: PersistenceHealth,
 }
 
@@ -194,10 +237,16 @@ where
         store: Option<ConfigStore>,
         snapshot_sender: watch::Sender<QueueSnapshot>,
     ) -> Self {
-        transport.set_gui_fallback_enabled(config.gui_fallback_enabled);
         transport.set_app_server_window_hidden(true);
         let now = Utc::now();
         let monotonic = Instant::now();
+        let current_prompt_recorded = machine
+            .snapshot()
+            .conversation
+            .iter()
+            .rev()
+            .find(|message| message.role == ConversationRole::User)
+            .is_some_and(|message| message.content == config.prompt);
         Self {
             transport,
             config,
@@ -211,6 +260,7 @@ where
             connection_failures: 0,
             turn_deadline: None,
             success_notified: false,
+            current_prompt_recorded,
             persistence: PersistenceHealth::default(),
         }
     }
@@ -255,18 +305,27 @@ where
                             let _ = self.handle_configure(config);
                         }
                         Some(RuntimeCommand::StartConfigured(config)) => {
-                            if self.machine.snapshot().phase == QueuePhase::Success {
-                                self.handle_stop().await?;
-                            }
-                            if self.handle_configure(config) {
-                                self.handle_start().await?;
-                            }
+                            self.handle_start_configured(config, None).await?;
+                        }
+                        Some(RuntimeCommand::SubmitConfigured { config, request_id }) => {
+                            self.handle_start_configured(config, Some(request_id)).await?;
                         }
                         Some(RuntimeCommand::Start) => self.handle_start().await?,
+                        Some(RuntimeCommand::Resume) => self.handle_resume().await?,
+                        Some(RuntimeCommand::QueueMessage(message)) => {
+                            self.handle_queue_message(message, None);
+                        }
+                        Some(RuntimeCommand::QueueMessageWithAck { message, request_id }) => {
+                            self.handle_queue_message(message, Some(request_id));
+                        }
                         Some(RuntimeCommand::Pause) => self.handle_pause().await?,
                         Some(RuntimeCommand::Stop) => self.handle_stop().await?,
                         Some(RuntimeCommand::Wake) => self.handle_explicit_wake(),
-                        Some(RuntimeCommand::Shutdown) | None => {
+                        Some(RuntimeCommand::Shutdown) => {
+                            self.handle_shutdown();
+                            break;
+                        }
+                        None => {
                             break;
                         }
                     }
@@ -314,44 +373,125 @@ where
         self.ensure_connection_and_thread().await
     }
 
+    async fn handle_start_configured(
+        &mut self,
+        config: QueueConfig,
+        request_id: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        if !self.handle_configure(config) {
+            return Ok(());
+        }
+        if matches!(
+            self.machine.snapshot().phase,
+            QueuePhase::Success | QueuePhase::Paused | QueuePhase::FatalError
+        ) && self.machine.snapshot().active_turn_id.is_none()
+        {
+            self.machine.prepare_follow_up();
+            self.publish_and_persist();
+        }
+        self.handle_start().await?;
+        if let Some(request_id) = request_id
+            && (self.started
+                || matches!(
+                    self.machine.snapshot().phase,
+                    QueuePhase::Connecting
+                        | QueuePhase::Sending
+                        | QueuePhase::Waiting
+                        | QueuePhase::Backoff
+                        | QueuePhase::Success
+                ))
+        {
+            self.machine.acknowledge_request(request_id);
+            self.publish_and_persist();
+        }
+        Ok(())
+    }
+
+    /// Resume the existing Codex thread without consuming whatever happens to
+    /// be in the editor as a fresh prompt.  A paused turn is reconciled by
+    /// `thread/resume`; if it was interrupted, the normal completion path will
+    /// schedule the conservative continuation retry.
+    async fn handle_resume(&mut self) -> Result<(), RuntimeError> {
+        if self.started {
+            return Ok(());
+        }
+        if self.machine.snapshot().active_thread_id.is_none() {
+            return self.handle_start().await;
+        }
+        if let Err(error) = self.config.validate_settings() {
+            self.machine.pause(&format!("配置无效：{error}"));
+            self.publish_and_persist();
+            return Ok(());
+        }
+        self.started = true;
+        self.success_notified = false;
+        if self.machine.snapshot().active_turn_id.is_some() {
+            self.machine.mark_retry_as_follow_up();
+        }
+        self.machine.reactivate();
+        self.publish_and_persist();
+        self.ensure_connection_and_thread().await
+    }
+
+    fn handle_queue_message(&mut self, message: PendingMessage, request_id: Option<u64>) {
+        if message.prompt.trim().is_empty() {
+            self.machine.set_status("待发送消息为空，未加入队列");
+        } else if !self.started
+            || !matches!(
+                self.machine.snapshot().phase,
+                QueuePhase::Connecting
+                    | QueuePhase::Sending
+                    | QueuePhase::Waiting
+                    | QueuePhase::Backoff
+            )
+        {
+            self.machine
+                .set_status("当前没有正在运行的任务，请直接发送消息");
+        } else if self.machine.snapshot().queued_message.is_some() {
+            self.machine
+                .set_status("已有一条待发送消息；请等待它发送后再加入下一条");
+        } else {
+            self.machine.set_queued_message(message);
+            if let Some(request_id) = request_id {
+                self.machine.acknowledge_request(request_id);
+            }
+            self.machine
+                .set_status("已加入待发送队列，将在当前任务结束后继续");
+        }
+        self.publish_and_persist();
+    }
+
     fn handle_configure(&mut self, config: QueueConfig) -> bool {
         if config == self.config {
             return true;
         }
+        let prompt_changed = config.prompt != self.config.prompt;
         let task_locked = self.started
             || self.machine.snapshot().active_turn_id.is_some()
             || self.machine.snapshot().submission_uncertain;
         if task_locked {
             let mut accepted = self.config.clone();
-            accepted.gui_fallback_enabled = config.gui_fallback_enabled;
+            accepted.default_prompt = config.default_prompt.clone();
+            accepted.auto_send_default_prompt = config.auto_send_default_prompt;
             accepted.full_screen_flash_enabled = config.full_screen_flash_enabled;
             accepted.audio_alert_enabled = config.audio_alert_enabled;
             let only_live_settings_changed = accepted == config;
 
-            self.config.gui_fallback_enabled = config.gui_fallback_enabled;
+            self.config.default_prompt = config.default_prompt;
+            self.config.auto_send_default_prompt = config.auto_send_default_prompt;
             self.config.full_screen_flash_enabled = config.full_screen_flash_enabled;
             self.config.audio_alert_enabled = config.audio_alert_enabled;
-            self.transport
-                .set_gui_fallback_enabled(self.config.gui_fallback_enabled);
             self.persist_config();
 
             if !only_live_settings_changed {
                 self.machine.set_runtime_warning(
-                    "任务运行中：提醒与兼容开关已生效，任务内容和重试参数需停止后修改",
+                    "任务运行中：提醒设置已生效，任务内容和重试参数需停止后修改",
                 );
             }
             self.publish_and_persist();
             return only_live_settings_changed;
         }
-        let task_changed = config.prompt != self.config.prompt
-            || config.working_directory != self.config.working_directory;
-        if task_changed && self.machine.snapshot().active_thread_id.is_some() {
-            self.machine
-                .set_status("更换任务或工作目录前请先点击“停止”，以创建新的持久线程");
-            self.publish_and_persist();
-            return false;
-        }
-        if let Err(error) = config.validate() {
+        if let Err(error) = config.validate_settings() {
             self.machine.set_status(&format!("配置无效：{error}"));
             self.publish_and_persist();
             return false;
@@ -365,8 +505,10 @@ where
             return false;
         }
         self.config = config;
-        self.transport
-            .set_gui_fallback_enabled(self.config.gui_fallback_enabled);
+        if prompt_changed {
+            self.current_prompt_recorded = false;
+            self.machine.clear_retry_mode();
+        }
         self.transport.set_app_server_window_hidden(true);
         self.persist_config();
         self.publish_and_persist();
@@ -472,6 +614,20 @@ where
             }
         }
         let now = Utc::now();
+        let continuation = self.machine.snapshot().retry_as_follow_up;
+        if !self.current_prompt_recorded {
+            self.machine.append_conversation_message(
+                ConversationRole::User,
+                &self.config.prompt,
+                false,
+            );
+            self.current_prompt_recorded = true;
+        }
+        let prompt = if continuation {
+            continuation_prompt()
+        } else {
+            self.config.prompt.clone()
+        };
         if let Err(error) = self.machine.begin_sending(now) {
             match error {
                 QueueError::TurnAlreadyActive => return Ok(()),
@@ -499,7 +655,7 @@ where
             .transport
             .start_turn(
                 &thread_id,
-                &self.config.prompt,
+                &prompt,
                 self.config.working_directory.as_deref(),
             )
             .await;
@@ -561,19 +717,6 @@ where
                 self.turn_deadline =
                     Some(Instant::now() + Duration::from_secs(self.config.turn_timeout_secs));
                 self.publish_and_persist();
-            }
-            TransportEvent::ThreadResolved {
-                previous_thread_id,
-                thread_id,
-                turn_id,
-            } => {
-                if self.machine.snapshot().active_thread_id.as_deref()
-                    == Some(previous_thread_id.as_str())
-                    && self.machine.snapshot().active_turn_id.as_deref() == Some(turn_id.as_str())
-                {
-                    self.machine.resolve_thread(thread_id);
-                    self.publish_and_persist();
-                }
             }
             TransportEvent::Error {
                 thread_id,
@@ -666,18 +809,28 @@ where
         };
         self.machine.set_reply_preview(&conversation_text);
         if !matches!(turn.status, TurnStatus::InProgress) {
+            self.machine.set_reply_completed_at(turn.completed_at);
             self.machine.clear_submission_uncertain();
         }
         self.turn_deadline = None;
         match decision {
             TurnDecision::Success => {
+                self.machine.append_conversation_message(
+                    ConversationRole::Assistant,
+                    &turn.final_message,
+                    false,
+                );
                 self.machine.succeed("任务成功完成");
-                self.started = false;
                 info!(
                     attempts = self.machine.snapshot().attempt_count,
                     "Longwatch 任务已成功完成"
                 );
                 self.notify_success();
+                if self.machine.snapshot().queued_message.is_some() {
+                    self.start_queued_message().await?;
+                } else {
+                    self.started = false;
+                }
             }
             TurnDecision::Retryable(reason) => {
                 if turn.final_message.trim().is_empty() {
@@ -696,9 +849,45 @@ where
                 self.machine.note_internal_retry_quiet(&reason)
             }
             TurnDecision::Pause(reason) => {
+                let terminal_text = if conversation_text.trim().is_empty() {
+                    reason.clone()
+                } else {
+                    conversation_text
+                };
+                self.machine.append_conversation_message(
+                    ConversationRole::Assistant,
+                    &terminal_text,
+                    true,
+                );
                 self.machine.pause(&reason);
                 self.started = false;
             }
+        }
+        self.publish_and_persist();
+        Ok(())
+    }
+
+    async fn start_queued_message(&mut self) -> Result<(), RuntimeError> {
+        let Some(message) = self.machine.take_queued_message() else {
+            self.started = false;
+            return Ok(());
+        };
+        self.config.prompt = message.prompt;
+        self.config.working_directory = message.working_directory;
+        self.config.failure_phrases = message.failure_phrases;
+        self.current_prompt_recorded = false;
+        self.success_notified = false;
+        self.machine.prepare_follow_up();
+        self.started = true;
+        self.persist_config();
+        if self.connected && self.machine.snapshot().active_thread_id.is_some() {
+            self.send_attempt().await?;
+        } else {
+            // Let the main loop perform connection establishment on its next
+            // deadline.  Calling ensure_connection_and_thread here would make
+            // the completion -> queued-message path recursively await itself.
+            self.machine.begin_connecting();
+            self.machine.set_next_attempt_at(Utc::now());
         }
         self.publish_and_persist();
         Ok(())
@@ -733,9 +922,7 @@ where
         let error_text = error.to_string();
         self.machine.set_reply_preview(&error_text);
         match error {
-            error @ (TransportError::ExecutableNotFound(_)
-            | TransportError::FallbackDisabled(_)
-            | TransportError::Unavailable(_)) => {
+            error @ TransportError::ExecutableNotFound(_) => {
                 self.shutdown_transport().await;
                 self.turn_deadline = None;
                 self.machine.pause(&error.to_string());
@@ -813,6 +1000,9 @@ where
     }
 
     fn schedule_connection_retry(&mut self, reason: &str) {
+        if self.machine.snapshot().active_turn_id.is_some() {
+            self.machine.mark_retry_as_follow_up();
+        }
         self.connection_failures = self.connection_failures.saturating_add(1);
         let delay_seconds = connection_retry_delay_seconds(self.connection_failures);
         self.machine.record_retry_alert();
@@ -857,7 +1047,7 @@ where
             self.machine.snapshot().active_thread_id.clone(),
             self.machine.snapshot().active_turn_id.clone(),
         );
-        self.machine.stop();
+        self.machine.stop_current_turn();
         self.turn_deadline = None;
         self.publish_and_persist();
         if let (Some(thread_id), Some(turn_id)) = active_turn {
@@ -870,6 +1060,13 @@ where
         }
         self.shutdown_transport().await;
         Ok(())
+    }
+
+    fn handle_shutdown(&mut self) {
+        self.started = false;
+        self.turn_deadline = None;
+        self.machine.clear_session();
+        self.publish_and_persist();
     }
 
     fn refresh_transport_status(&mut self) {
@@ -943,6 +1140,7 @@ where
                     Err(_) => warn!("回合超时后的中断请求再次超时"),
                 }
                 self.reset_wake_baseline();
+                self.machine.mark_retry_as_follow_up();
                 self.machine.clear_active_turn();
                 self.turn_deadline = None;
                 self.schedule_retry("回合超时，已发送中断请求");
@@ -956,6 +1154,9 @@ where
 
     fn schedule_retry(&mut self, reason: &str) {
         self.turn_deadline = None;
+        if self.machine.snapshot().active_turn_id.is_some() {
+            self.machine.mark_retry_as_follow_up();
+        }
         if self.machine.snapshot().reply_preview.trim().is_empty() {
             self.machine.set_reply_preview(reason);
         }
@@ -980,6 +1181,9 @@ where
         const SETTLE_DELAY_SECS: i64 = 1;
         let now = Utc::now();
         self.turn_deadline = None;
+        if self.machine.snapshot().active_turn_id.is_some() {
+            self.machine.mark_retry_as_follow_up();
+        }
         if self.machine.snapshot().reply_preview.trim().is_empty() {
             self.machine.set_reply_preview(reason);
         }
@@ -996,6 +1200,9 @@ where
     fn schedule_quiet_immediate_retry(&mut self, reason: &str) {
         let now = Utc::now();
         self.turn_deadline = None;
+        if self.machine.snapshot().active_turn_id.is_some() {
+            self.machine.mark_retry_as_follow_up();
+        }
         if self.machine.snapshot().reply_preview.trim().is_empty() {
             self.machine.set_reply_preview(reason);
         }
@@ -1185,6 +1392,13 @@ fn error_conversation_text(error: &TurnError) -> String {
     }
 }
 
+/// Prompt used for a new external turn after the previous turn was interrupted
+/// or failed.  The persistent Codex thread already contains the original task,
+/// so repeating it verbatim can cause duplicated edits or repeated work.
+fn continuation_prompt() -> String {
+    "请继续完成上一个任务。先检查当前工作区和已有进度，从中断处继续；不要重复已经完成的工作。完成后简要说明本轮新增或修正的内容。".into()
+}
+
 fn notification_preview(text: &str, max_chars: usize) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -1229,6 +1443,14 @@ mod tests {
         );
         assert_eq!(notification_preview("abcdef", 4), "abcd…");
         assert_eq!(notification_preview("   ", 20), "任务已完成");
+    }
+
+    #[test]
+    fn external_retry_uses_a_continue_instruction_instead_of_the_original_task() {
+        let prompt = continuation_prompt();
+
+        assert!(prompt.contains("继续完成上一个任务"));
+        assert!(prompt.contains("不要重复已经完成的工作"));
     }
 
     #[derive(Debug, Default)]
@@ -1390,6 +1612,74 @@ mod tests {
         task.await.unwrap().unwrap();
     }
 
+    #[tokio::test]
+    async fn enabled_default_message_is_sent_once_on_launch() {
+        let (transport, starts, thread_starts) = ScriptedTransport::new(Script::Success);
+        let config = QueueConfig {
+            default_prompt: "automatic task".into(),
+            auto_send_default_prompt: true,
+            ..QueueConfig::default()
+        };
+        let handle = spawn_runtime(transport, config, PersistedQueueState::default(), None);
+        let mut snapshots = handle.snapshot();
+
+        wait_for_phase(&mut snapshots, QueuePhase::Success).await;
+
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(thread_starts.load(Ordering::SeqCst), 1);
+        handle.send(RuntimeCommand::Shutdown).await.unwrap();
+        handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_default_message_never_auto_sends() {
+        let (transport, starts, thread_starts) = ScriptedTransport::new(Script::Success);
+        let config = QueueConfig {
+            auto_send_default_prompt: true,
+            ..QueueConfig::default()
+        };
+        let handle = spawn_runtime(transport, config, PersistedQueueState::default(), None);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(thread_starts.load(Ordering::SeqCst), 0);
+        assert_eq!(handle.snapshot().borrow().phase, QueuePhase::Idle);
+        handle.send(RuntimeCommand::Shutdown).await.unwrap();
+        handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_active_persisted_task_wins_over_startup_auto_send() {
+        let resumes = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let transport = ResumeCompletedTransport {
+            resumes: Arc::clone(&resumes),
+            starts: Arc::clone(&starts),
+        };
+        let config = QueueConfig {
+            prompt: "persisted task".into(),
+            default_prompt: "automatic task".into(),
+            auto_send_default_prompt: true,
+            ..QueueConfig::default()
+        };
+        let state = PersistedQueueState {
+            phase: QueuePhase::Waiting,
+            active_thread_id: Some("thread".into()),
+            active_turn_id: Some("persisted-turn".into()),
+            prompt_digest: Some(prompt_digest(&config.prompt)),
+            ..PersistedQueueState::default()
+        };
+        let handle = spawn_runtime(transport, config, state, None);
+        let mut snapshots = handle.snapshot();
+
+        wait_for_phase(&mut snapshots, QueuePhase::Success).await;
+
+        assert_eq!(resumes.load(Ordering::SeqCst), 1);
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        handle.send(RuntimeCommand::Shutdown).await.unwrap();
+        handle.join().await.unwrap();
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum Script {
         HighDemand,
@@ -1403,22 +1693,26 @@ mod tests {
     struct ScriptedTransport {
         script: Script,
         starts: Arc<AtomicUsize>,
+        thread_starts: Arc<AtomicUsize>,
         sender: mpsc::Sender<TransportEvent>,
         receiver: mpsc::Receiver<TransportEvent>,
     }
 
     impl ScriptedTransport {
-        fn new(script: Script) -> (Self, Arc<AtomicUsize>) {
+        fn new(script: Script) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
             let (sender, receiver) = mpsc::channel(16);
             let starts = Arc::new(AtomicUsize::new(0));
+            let thread_starts = Arc::new(AtomicUsize::new(0));
             (
                 Self {
                     script,
                     starts: Arc::clone(&starts),
+                    thread_starts: Arc::clone(&thread_starts),
                     sender,
                     receiver,
                 },
                 starts,
+                thread_starts,
             )
         }
     }
@@ -1432,6 +1726,7 @@ mod tests {
             &mut self,
             _: Option<&std::path::Path>,
         ) -> Result<ThreadSession, TransportError> {
+            self.thread_starts.fetch_add(1, Ordering::SeqCst);
             Ok(ThreadSession {
                 id: "thread".into(),
                 latest_turn: None,
@@ -1464,6 +1759,7 @@ mod tests {
                             status: TurnStatus::Completed,
                             final_message: "We're experiencing high demand. Please try again later.".into(),
                             error: None,
+                            completed_at: None,
                         },
                     }).await.unwrap();
                 }
@@ -1484,6 +1780,7 @@ mod tests {
                                 status,
                                 final_message,
                                 error: None,
+                                completed_at: None,
                             },
                         })
                         .await
@@ -1511,6 +1808,7 @@ mod tests {
                                 status: TurnStatus::Completed,
                                 final_message: "success".into(),
                                 error: None,
+                                completed_at: None,
                             },
                         })
                         .await
@@ -1539,6 +1837,7 @@ mod tests {
                                 status: TurnStatus::Completed,
                                 final_message: "success".into(),
                                 error: None,
+                                completed_at: None,
                             },
                         })
                         .await
@@ -1575,7 +1874,7 @@ mod tests {
 
     #[tokio::test]
     async fn high_demand_schedules_one_future_request_without_an_immediate_duplicate() {
-        let (transport, starts) = ScriptedTransport::new(Script::HighDemand);
+        let (transport, starts, _) = ScriptedTransport::new(Script::HighDemand);
         let config = QueueConfig {
             prompt: "do real work".into(),
             ..QueueConfig::default()
@@ -1597,7 +1896,7 @@ mod tests {
 
     #[tokio::test]
     async fn current_high_demand_notice_retries_immediately_without_alert_or_backoff() {
-        let (transport, starts) = ScriptedTransport::new(Script::CurrentHighDemandThenSuccess);
+        let (transport, starts, _) = ScriptedTransport::new(Script::CurrentHighDemandThenSuccess);
         let config = QueueConfig {
             prompt: "do real work".into(),
             ..QueueConfig::default()
@@ -1623,7 +1922,7 @@ mod tests {
 
     #[tokio::test]
     async fn internal_retry_and_success_never_start_a_second_turn() {
-        let (transport, starts) = ScriptedTransport::new(Script::InternalRetryThenSuccess);
+        let (transport, starts, _) = ScriptedTransport::new(Script::InternalRetryThenSuccess);
         let config = QueueConfig {
             prompt: "do real work".into(),
             ..QueueConfig::default()
@@ -1645,7 +1944,7 @@ mod tests {
 
     #[tokio::test]
     async fn textual_stream_disconnect_stays_in_the_retry_loop_and_is_shown_as_a_reply() {
-        let (transport, starts) = ScriptedTransport::new(Script::StreamDisconnect);
+        let (transport, starts, _) = ScriptedTransport::new(Script::StreamDisconnect);
         let config = QueueConfig {
             prompt: "do real work".into(),
             ..QueueConfig::default()
@@ -1675,7 +1974,7 @@ mod tests {
 
     #[tokio::test]
     async fn normal_success_stops_all_future_sends() {
-        let (transport, starts) = ScriptedTransport::new(Script::Success);
+        let (transport, starts, _) = ScriptedTransport::new(Script::Success);
         let config = QueueConfig {
             prompt: "do real work".into(),
             ..QueueConfig::default()
@@ -1698,8 +1997,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn success_can_start_a_new_configured_task() {
-        let (transport, starts) = ScriptedTransport::new(Script::Success);
+    async fn success_can_continue_the_same_thread_with_a_follow_up() {
+        let (transport, starts, thread_starts) = ScriptedTransport::new(Script::Success);
         let config = QueueConfig {
             prompt: "first task".into(),
             ..QueueConfig::default()
@@ -1733,6 +2032,12 @@ mod tests {
         .await
         .expect("second configured task completed");
 
+        assert_eq!(thread_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            snapshots.borrow().active_thread_id.as_deref(),
+            Some("thread")
+        );
+
         commands.send(RuntimeCommand::Shutdown).await.unwrap();
         task.await.unwrap().unwrap();
     }
@@ -1762,6 +2067,7 @@ mod tests {
                     status: TurnStatus::InProgress,
                     final_message: String::new(),
                     error: None,
+                    completed_at: None,
                 }),
             })
             .await
@@ -1831,6 +2137,7 @@ mod tests {
                     status: TurnStatus::Completed,
                     final_message: "late duplicate".into(),
                     error: None,
+                    completed_at: None,
                 },
             })
             .await
@@ -1845,43 +2152,6 @@ mod tests {
             runtime.machine().snapshot().reply_preview,
             "current preview"
         );
-    }
-
-    #[tokio::test]
-    async fn gui_session_resolution_replaces_only_the_thread_id() {
-        let config = QueueConfig {
-            prompt: "do real work".into(),
-            ..QueueConfig::default()
-        };
-        let state = PersistedQueueState {
-            phase: QueuePhase::Waiting,
-            active_thread_id: Some("gui-pending".into()),
-            active_turn_id: Some("logical-turn".into()),
-            ..PersistedQueueState::default()
-        };
-        let machine = QueueMachine::restore(state, config.codex_path.clone());
-        let (sender, _) = watch::channel(machine.snapshot().clone());
-        let mut runtime = QueueRuntime::new(NoopTransport, config, machine, None, sender);
-        runtime.started = true;
-
-        runtime
-            .handle_event(TransportEvent::ThreadResolved {
-                previous_thread_id: "gui-pending".into(),
-                thread_id: "thread-real".into(),
-                turn_id: "logical-turn".into(),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            runtime.machine().snapshot().active_thread_id.as_deref(),
-            Some("thread-real")
-        );
-        assert_eq!(
-            runtime.machine().snapshot().active_turn_id.as_deref(),
-            Some("logical-turn")
-        );
-        assert_eq!(runtime.machine().snapshot().phase, QueuePhase::Waiting);
     }
 
     #[test]
@@ -2026,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_the_task_requires_stopping_the_persisted_thread() {
+    fn a_follow_up_message_keeps_the_existing_thread() {
         let config = QueueConfig {
             prompt: "old task".into(),
             ..QueueConfig::default()
@@ -2043,12 +2313,37 @@ mod tests {
         let mut edited = config;
         edited.prompt = "new task".into();
 
-        assert!(!runtime.handle_configure(edited));
-        assert_eq!(runtime.config.prompt, "old task");
+        assert!(runtime.handle_configure(edited));
+        assert_eq!(runtime.config.prompt, "new task");
         assert_eq!(
             runtime.machine().snapshot().active_thread_id.as_deref(),
             Some("thread")
         );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_clears_the_session_for_the_next_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::in_directory(directory.path().to_path_buf());
+        let config = QueueConfig {
+            prompt: "do real work".into(),
+            ..QueueConfig::default()
+        };
+        let mut machine = QueueMachine::new(config.codex_path.clone());
+        machine.set_thread("thread".into());
+        let (sender, _) = watch::channel(machine.snapshot().clone());
+        let (commands, receiver) = mpsc::channel(4);
+        let runtime =
+            QueueRuntime::new(NoopTransport, config, machine, Some(store.clone()), sender);
+        let task = tokio::spawn(runtime.run(receiver));
+
+        commands.send(RuntimeCommand::Shutdown).await.unwrap();
+        task.await.unwrap().unwrap();
+
+        let state = store.load_state().unwrap();
+        assert_eq!(state.phase, QueuePhase::Idle);
+        assert!(state.active_thread_id.is_none());
+        assert!(state.active_turn_id.is_none());
     }
 
     #[tokio::test]
@@ -2114,6 +2409,7 @@ mod tests {
                     status: TurnStatus::Completed,
                     final_message: "completed while the app was closed".into(),
                     error: None,
+                    completed_at: None,
                 }),
             })
         }

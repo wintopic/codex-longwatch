@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -47,6 +48,7 @@ type CompletedMessages = Arc<Mutex<HashMap<(String, String), CompletedAgentMessa
 struct CompletedAgentMessage {
     text: String,
     explicit_final: bool,
+    completed_at: Option<DateTime<Utc>>,
 }
 
 /// JSON-RPC request identifiers are either strings or signed integers. We
@@ -611,10 +613,13 @@ async fn dispatch_message(
                 .lock()
                 .await
                 .remove(&(thread_id.clone(), turn.id.clone()));
-            if turn.final_message.trim().is_empty()
-                && let Some(cached) = cached
-            {
-                turn.final_message = cached.text;
+            if let Some(cached) = cached {
+                if turn.final_message.trim().is_empty() {
+                    turn.final_message = cached.text;
+                }
+                // The final agent item is the most precise source. Fall back
+                // to the turn timestamp when older servers omit it.
+                turn.completed_at = cached.completed_at.or(turn.completed_at);
             }
         }
         if matches!(&event, TransportEvent::AgentMessageDelta { .. }) {
@@ -671,6 +676,10 @@ fn parse_completed_agent_message(
         CompletedAgentMessage {
             text: string_field(item, "text")?,
             explicit_final: phase == Some("final_answer"),
+            completed_at: params
+                .get("completedAtMs")
+                .and_then(Value::as_i64)
+                .and_then(DateTime::<Utc>::from_timestamp_millis),
         },
     ))
 }
@@ -743,11 +752,16 @@ fn parse_turn(value: &Value) -> Result<RestoredTurn, TransportError> {
         .filter(|error| !error.is_null())
         .and_then(|error| serde_json::from_value::<TurnError>(error.clone()).ok());
     let final_message = extract_final_message(value.get("items"));
+    let completed_at = value
+        .get("completedAt")
+        .and_then(Value::as_i64)
+        .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0));
     Ok(RestoredTurn {
         id,
         status,
         final_message,
         error,
+        completed_at,
     })
 }
 
@@ -786,6 +800,7 @@ mod tests {
         let turn = json!({
             "id": "t1",
             "status": "completed",
+            "completedAt": 1_725_000_000,
             "items": [
                 {"type": "reasoning", "id": "r", "summary": []},
                 {"type": "agentMessage", "id": "a1", "text": "first"},
@@ -795,6 +810,10 @@ mod tests {
         });
         let parsed = parse_turn(&turn).unwrap();
         assert_eq!(parsed.final_message, "final");
+        assert_eq!(
+            parsed.completed_at,
+            DateTime::<Utc>::from_timestamp(1_725_000_000, 0)
+        );
     }
 
     #[test]
@@ -802,6 +821,7 @@ mod tests {
         let final_item = parse_completed_agent_message(&json!({
             "threadId": "th",
             "turnId": "tu",
+            "completedAtMs": 1_725_000_000_123_i64,
             "item": {
                 "id": "item-1",
                 "type": "agentMessage",
@@ -813,6 +833,10 @@ mod tests {
         assert_eq!(final_item.0, ("th".into(), "tu".into()));
         assert_eq!(final_item.1.text, "final answer");
         assert!(final_item.1.explicit_final);
+        assert_eq!(
+            final_item.1.completed_at,
+            DateTime::<Utc>::from_timestamp_millis(1_725_000_000_123)
+        );
 
         assert!(
             parse_completed_agent_message(&json!({

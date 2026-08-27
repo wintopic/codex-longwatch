@@ -108,6 +108,7 @@ async fn completed_item_stops_the_runtime_without_scheduling_an_empty_reply_retr
     assert_eq!(snapshot.phase, QueuePhase::Success);
     assert_eq!(snapshot.attempt_count, 1);
     assert_eq!(snapshot.reply_preview, "final from item");
+    assert!(snapshot.reply_completed_at.is_some());
     assert!(snapshot.transport_status.connected);
     assert_eq!(snapshot.transport_status.kind, TransportKind::AppServer);
     assert_eq!(
