@@ -20,6 +20,7 @@
     clippy::semicolon_if_nothing_returned,
     clippy::unreadable_literal,
     clippy::unused_async,
+    clippy::unused_async_trait_impl,
     clippy::unused_self
 )]
 
