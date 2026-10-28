@@ -1339,7 +1339,7 @@ mod tests {
         .unwrap();
         let latest = legacy.latest_turn.unwrap();
         assert_eq!(latest.id, "last");
-        assert!(latest.client_message_ids.is_empty());
+        assert_eq!(latest.client_message_ids, Vec::<String>::new());
         assert!(!latest.client_ids_reported);
     }
 

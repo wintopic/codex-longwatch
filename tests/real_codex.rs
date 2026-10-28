@@ -63,7 +63,7 @@ async fn real_app_server_round_trip_with_reconciliation() {
     .await
     .unwrap();
     assert_eq!(completed.status, TurnStatus::Completed);
-    assert!(!completed.final_message.trim().is_empty());
+    assert_ne!(completed.final_message.trim(), "");
     assert_eq!(
         transport
             .fetch_turn_message(&thread.id, &turn.id)

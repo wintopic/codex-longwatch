@@ -934,7 +934,10 @@ mod tests {
         let state = machine.persisted(None);
         let restored = QueueMachine::restore(state, "codex".into());
 
-        assert!(restored.snapshot().conversation.is_empty());
+        assert_eq!(
+            restored.snapshot().conversation,
+            Vec::<ConversationMessage>::new()
+        );
         assert_eq!(
             restored
                 .snapshot()

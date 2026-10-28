@@ -132,6 +132,9 @@ pub enum TransportError {
 }
 
 #[async_trait]
+// async-trait marks the boxed futures it returns `#[must_use]`, which
+// clippy's `double_must_use` reports on every method.
+#[allow(clippy::double_must_use)]
 pub trait CodexTransport: Send {
     fn set_app_server_window_hidden(&mut self, _hidden: bool) {}
     /// Identity presented on the next `connect`.

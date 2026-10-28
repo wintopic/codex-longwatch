@@ -1081,6 +1081,9 @@ mod tests {
 
         let document = fs::read_to_string(store.directory().join("state.json")).unwrap();
         assert!(!document.contains("temporary local history"));
-        assert!(store.load_state().unwrap().conversation.is_empty());
+        assert_eq!(
+            store.load_state().unwrap().conversation,
+            Vec::<ConversationMessage>::new()
+        );
     }
 }

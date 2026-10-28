@@ -1834,7 +1834,7 @@ where
         mut self,
         mut commands: mpsc::Receiver<RuntimeCommand>,
     ) -> Result<(), RuntimeError> {
-        if let Err(error) = self.initialize().await {
+        if let Err(error) = self.initialize() {
             self.shutdown_all().await;
             return Err(error);
         }
@@ -1868,7 +1868,7 @@ where
         Ok(())
     }
 
-    async fn initialize(&mut self) -> Result<(), RuntimeError> {
+    fn initialize(&mut self) -> Result<(), RuntimeError> {
         let scheduler_state = self
             .store
             .as_ref()
@@ -1913,8 +1913,7 @@ where
             first_config,
             first_state,
             self.store.clone(),
-        )
-        .await?;
+        );
 
         // Restore only work that can still make progress. Completed and failed
         // sessions are temporary UI history and are removed on startup.
@@ -1949,8 +1948,7 @@ where
                     session_config,
                     session_state,
                     Some(session_store),
-                )
-                .await?;
+                );
                 self.next_session_id = self.next_session_id.max(id.saturating_add(1));
             }
         }
@@ -1964,14 +1962,14 @@ where
         Ok(())
     }
 
-    async fn spawn_slot(
+    fn spawn_slot(
         &mut self,
         id: u64,
         transport: T,
         mut config: QueueConfig,
         state: PersistedQueueState,
         store: Option<ConfigStore>,
-    ) -> Result<(), RuntimeError> {
+    ) {
         config.max_concurrent_sessions = self.base_config.max_concurrent_sessions;
         let restore_is_active = state.phase.is_running();
         let auto_start_is_active = state.phase == QueuePhase::Idle
@@ -1998,7 +1996,6 @@ where
             assigned_order,
             _transport: std::marker::PhantomData,
         });
-        Ok(())
     }
 
     async fn handle_command(&mut self, command: RuntimeCommand) -> Result<bool, RuntimeError> {
@@ -2287,8 +2284,7 @@ where
                 config.clone(),
                 PersistedQueueState::default(),
                 store,
-            )
-            .await?;
+            );
             self.slots.len() - 1
         };
         let order = self.next_assignment_order();
