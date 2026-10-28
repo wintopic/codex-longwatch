@@ -149,12 +149,20 @@ fn show_toast_with_icon_context(
     })
 }
 
+/// Keeps recent toasts alive: a toast's `Activated` handler only fires while
+/// the toast object exists, and several sessions can finish while an earlier
+/// alarm toast is still waiting on screen.
 #[cfg(target_os = "windows")]
 fn retain_windows_toast(toast: windows::UI::Notifications::ToastNotification) {
-    static ACTIVE_TOAST: OnceLock<Mutex<Option<windows::UI::Notifications::ToastNotification>>> =
-        OnceLock::new();
-    if let Ok(mut active) = ACTIVE_TOAST.get_or_init(|| Mutex::new(None)).lock() {
-        *active = Some(toast);
+    const MAX_RETAINED_TOASTS: usize = 16;
+    static ACTIVE_TOASTS: OnceLock<
+        Mutex<std::collections::VecDeque<windows::UI::Notifications::ToastNotification>>,
+    > = OnceLock::new();
+    if let Ok(mut active) = ACTIVE_TOASTS.get_or_init(Mutex::default).lock() {
+        if active.len() == MAX_RETAINED_TOASTS {
+            active.pop_front();
+        }
+        active.push_back(toast);
     }
 }
 
@@ -162,20 +170,31 @@ fn retain_windows_toast(toast: windows::UI::Notifications::ToastNotification) {
 fn windows_toast_xml(
     title: &str,
     body: &str,
-    _action: Option<&NotificationAction>,
+    action: Option<&NotificationAction>,
     audio_enabled: bool,
 ) -> String {
     let title = escape_xml(title);
     let body = escape_xml(body);
+    let visual = format!(
+        "<visual><binding template=\"ToastGeneric\"><text hint-wrap=\"true\">{title}</text><text hint-wrap=\"true\">{body}</text></binding></visual>"
+    );
     if audio_enabled {
-        return format!(
-            "<toast scenario=\"alarm\" duration=\"long\"><visual><binding template=\"ToastGeneric\"><text hint-wrap=\"true\">{title}</text><text hint-wrap=\"true\">{body}</text></binding></visual><audio src=\"ms-winsoundevent:Notification.Looping.Alarm\" loop=\"true\"/><commands scenario=\"alarm\"><command id=\"dismiss\"/></commands></toast>"
-        );
+        // An alarm toast needs a button to stay on screen. When there is a
+        // thread to open, that button is 查看; clicking it also stops the
+        // alarm. Without one, only the system dismiss button makes sense.
+        let audio = "<audio src=\"ms-winsoundevent:Notification.Looping.Alarm\" loop=\"true\"/>";
+        return match action {
+            Some(action) => format!(
+                "<toast scenario=\"alarm\" duration=\"long\">{visual}<actions><action content=\"{label}\" arguments=\"open\" activationType=\"foreground\"/></actions>{audio}</toast>",
+                label = escape_xml(&action.label),
+            ),
+            None => format!(
+                "<toast scenario=\"alarm\" duration=\"long\">{visual}{audio}<commands scenario=\"alarm\"><command id=\"dismiss\"/></commands></toast>"
+            ),
+        };
     }
 
-    format!(
-        "<toast><visual><binding template=\"ToastGeneric\"><text hint-wrap=\"true\">{title}</text><text hint-wrap=\"true\">{body}</text></binding></visual><audio silent=\"true\"/></toast>"
-    )
+    format!("<toast>{visual}<audio silent=\"true\"/></toast>")
 }
 
 #[cfg(target_os = "windows")]
@@ -192,6 +211,18 @@ fn escape_xml(input: &str) -> String {
 mod windows_tests {
     use super::*;
 
+    /// Parses the XML the same way `show_windows_toast` does, without showing
+    /// anything on screen.
+    fn assert_windows_accepts(xml: &str) {
+        use windows::{
+            Data::Xml::Dom::XmlDocument, UI::Notifications::ToastNotification, core::HSTRING,
+        };
+
+        let document = XmlDocument::new().unwrap();
+        document.LoadXml(&HSTRING::from(xml)).unwrap();
+        ToastNotification::CreateToastNotification(&document).unwrap();
+    }
+
     #[test]
     fn enabled_audio_uses_a_persistent_looping_alarm_toast() {
         let action = NotificationAction::open_thread("thread-1", "codex");
@@ -200,15 +231,35 @@ mod windows_tests {
         assert!(xml.contains("duration=\"long\""));
         assert!(xml.contains("Notification.Looping.Alarm"));
         assert!(xml.contains("loop=\"true\""));
-        assert!(xml.contains("<command id=\"dismiss\"/>"));
-        assert!(!xml.contains("<actions>"));
         assert!(!xml.contains("appLogoOverride"));
+        assert_windows_accepts(&xml);
+    }
+
+    #[test]
+    fn alarm_with_a_thread_offers_view_instead_of_dismiss() {
+        let action = NotificationAction::open_thread("thread-1", "codex");
+        let xml = windows_toast_xml("完成", "任务已完成", Some(&action), true);
+        assert!(xml.contains(
+            "<actions><action content=\"查看\" arguments=\"open\" activationType=\"foreground\"/></actions>"
+        ));
+        assert!(!xml.contains("<command id=\"dismiss\"/>"));
+        assert!(!xml.contains("<commands"));
     }
 
     #[test]
     fn alarm_without_a_thread_keeps_the_system_dismiss_button() {
         let xml = windows_toast_xml("完成", "任务已完成", None, true);
         assert!(xml.contains("<command id=\"dismiss\"/>"));
+        assert!(!xml.contains("<actions>"));
+        assert_windows_accepts(&xml);
+    }
+
+    #[test]
+    fn toast_text_is_escaped() {
+        let xml = windows_toast_xml("a < b & \"c\"", "<script>", None, false);
+        assert!(xml.contains("a &lt; b &amp; &quot;c&quot;"));
+        assert!(xml.contains("&lt;script&gt;"));
+        assert_windows_accepts(&xml);
     }
 
     #[test]
@@ -219,12 +270,14 @@ mod windows_tests {
         assert!(xml.contains("audio silent=\"true\""));
         assert!(!xml.contains("<actions>"));
         assert!(!xml.contains("appLogoOverride"));
+        assert_windows_accepts(&xml);
     }
 
     #[test]
     #[ignore = "shows a native looping Windows alarm toast for manual verification"]
     fn preview_windows_alarm_toast() {
-        notify_success("任务完成", "已完成", None, true).unwrap();
+        let action = NotificationAction::open_thread("preview-thread", "codex");
+        notify_success("任务完成", "已完成", Some(&action), true).unwrap();
     }
 
     #[test]
