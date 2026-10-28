@@ -1,9 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use codex_longwatch::{
@@ -99,6 +96,8 @@ fn init_logging(store: &ConfigStore) -> Result<WorkerGuard> {
 
 #[cfg(target_os = "windows")]
 fn install_panic_hook() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     static PANIC_DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
     std::panic::set_hook(Box::new(|panic| {
         let panic_message = panic.to_string();
