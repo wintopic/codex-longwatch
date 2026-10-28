@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::classifier::TurnError;
+use crate::{classifier::TurnError, config::ClientIdentity};
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +56,14 @@ pub struct RestoredTurn {
     /// Authoritative completion timestamp supplied by Codex app-server.
     #[serde(default)]
     pub completed_at: Option<DateTime<Utc>>,
+    /// `clientId` values of the user messages in this turn, i.e. the
+    /// `clientUserMessageId`s that started or steered it.
+    #[serde(default)]
+    pub client_message_ids: Vec<String>,
+    /// Whether the server reports `clientId` on user messages at all. Older
+    /// servers omit the field, so a missing id proves nothing there.
+    #[serde(default)]
+    pub client_ids_reported: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -90,6 +98,11 @@ pub enum TransportEvent {
         thread_id: String,
         turn: RestoredTurn,
     },
+    /// Codex 0.160+ 新增的线程级状态通知。`systemError` 表示线程已经
+    /// 无法继续推进，此时既不会再有 turn 事件，也不会自动恢复。
+    ThreadSystemError {
+        thread_id: String,
+    },
     Disconnected {
         message: String,
     },
@@ -121,6 +134,8 @@ pub enum TransportError {
 #[async_trait]
 pub trait CodexTransport: Send {
     fn set_app_server_window_hidden(&mut self, _hidden: bool) {}
+    /// Identity presented on the next `connect`.
+    fn set_client_identity(&mut self, _identity: ClientIdentity) {}
     fn status(&self) -> TransportStatus {
         TransportStatus::default()
     }
@@ -131,17 +146,28 @@ pub trait CodexTransport: Send {
         thread_id: &str,
         cwd: Option<&Path>,
     ) -> Result<ThreadSession, TransportError>;
+    /// `client_message_id` is sent as `clientUserMessageId`, exactly like the
+    /// official clients, so the turn can be recognised after a reconnect.
     async fn start_turn(
         &mut self,
         thread_id: &str,
         prompt: &str,
         cwd: Option<&Path>,
+        client_message_id: &str,
     ) -> Result<StartedTurn, TransportError>;
     async fn interrupt_turn(
         &mut self,
         thread_id: &str,
         turn_id: &str,
     ) -> Result<(), TransportError>;
+    /// 从持久化历史里回捞某个回合的最终助手文本。
+    ///
+    /// Codex 0.160+ 的 `turn/completed` 只带 `itemsView: "notLoaded"` 的空
+    /// items，流式阶段的 `item/completed` 才是正文来源。若客户端在断流后
+    /// 重连、缓存缺失，就必须回到 `thread/read` 才能拿到权威答案。
+    async fn fetch_turn_message(&mut self, _thread_id: &str, _turn_id: &str) -> Option<String> {
+        None
+    }
     async fn next_event(&mut self) -> Option<TransportEvent>;
     async fn shutdown(&mut self);
 }

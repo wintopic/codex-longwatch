@@ -7,7 +7,7 @@
 <p align="center"><strong>Stay with the task.</strong></p>
 
 <p align="center">
-  A native desktop companion that keeps one Codex task alive through overloads, disconnects, restarts, and long waits—without running concurrent turns.
+  A native desktop companion that keeps Codex tasks alive through overloads, disconnects, restarts, and long waits—serial by default, with optional independent sessions in parallel.
 </p>
 
 <p align="center">
@@ -30,19 +30,21 @@
 
 Long Codex tasks sometimes encounter temporary capacity errors, a closed event stream, or a machine that sleeps halfway through the job. Retrying manually is distracting; blindly resubmitting is worse because it can create duplicate or overlapping work.
 
-Longwatch owns the waiting loop. It sends the exact task you entered, keeps a single persistent Codex thread, classifies terminal outcomes, waits conservatively when retrying, and alerts you when a valid result arrives.
+Longwatch owns the waiting loop. Each task gets a persistent Codex thread, terminal outcomes are classified, retries wait conservatively, and a valid result triggers an alert. Concurrency defaults to one; when more throughput is useful, independent sessions can run side by side.
 
-It does **not** generate filler prompts, rotate accounts, bypass limits, or run parallel turns.
+It does **not** generate filler prompts, rotate accounts, or bypass limits. A session still has exactly one active turn; parallel work happens only across distinct sessions after the user raises the concurrency setting.
 
 ## Highlights
 
 - **One durable thread, one active turn.** A small deterministic state machine prevents overlapping requests.
+- **Optional multi-session scheduling.** The default remains one session. Settings can enable 1–8 isolated sessions; excess tasks wait in a FIFO queue and start when a slot becomes available.
 - **Crash-safe reconciliation.** A submission marker is persisted before `turn/start`; after a restart, Longwatch resumes the thread and asks Codex what actually happened before it considers another send.
 - **Protocol-first integration.** The primary transport is `codex app-server --listen stdio://`, using newline-delimited JSON-RPC.
+- **Same requests as the official app.** By default Longwatch introduces itself to app-server exactly like the ChatGPT desktop app, so upstream requests carry `originator: Codex Desktop` and the same User-Agent. Settings can switch to the Codex CLI identity or Longwatch's own.
 - **Conservative retry policy.** Ordinary transient failures use exponential backoff from 30 seconds to 10 minutes with ±15% jitter and a hard 15-second floor.
 - **Codex-aware outcomes.** Overload responses, selected HTTP failures, stream loss, empty replies, internal retries, authentication failures, and policy errors are handled differently.
 - **Sleep-safe scheduling.** After system resume, Longwatch waits at least 60 seconds and never performs a burst of missed retries.
-- **Native desktop experience.** GPUI interface, native notifications, Windows tray controls, deep-link/CLI result opening, and privacy-conscious diagnostics.
+- **Queue-first workbench.** A Qoder-style window whose sidebar is the queue — running, retrying with a live countdown, waiting by position, finished — next to one task's conversation. Everything else lives on a separate settings page.
 - **Cross-platform releases.** GitHub Actions builds a Windows installer and portable ZIP, Linux DEB/AppImage/tarball, and macOS DMG/portable app bundles for Intel and Apple Silicon.
 - **Theme-aware macOS icon.** The running Dock icon switches between white/dark-mark and dark/white-mark variants with the system appearance.
 
@@ -67,14 +69,20 @@ The runtime serializes all transitions through one Tokio task. `QueueMachine::be
 The preferred path starts the official Codex CLI app server and exchanges newline-delimited JSON-RPC over stdio:
 
 ```text
-initialize
-thread/start or thread/resume
-turn/start
+initialize                       clientInfo + capabilities, as the desktop app sends them
+thread/start                     threadSource "user"
+thread/resume                    excludeTurns + initialTurnsPage (latest turn only)
+turn/start                       text input tagged with a clientUserMessageId
 item/agentMessage/delta          (volatile preview)
 item/completed                   (authoritative message item)
 turn/completed                   (terminal decision point)
+thread/items/list                (re-reads a final reply missed while disconnected)
 turn/interrupt                   (pause, stop, or timeout)
 ```
+
+The request identity decides what upstream services see. With the default **Official desktop** identity, `initialize` sends `clientInfo { name: "codex_desktop", title: "Codex Desktop" }` and app-server is started with `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=Codex Desktop`, exactly as the ChatGPT desktop app starts it. **Codex CLI** uses `codex_cli_rs`; **Longwatch** uses `codex-longwatch`.
+
+Interactive server requests (command or file-change approvals, extra permissions, tool user input, MCP elicitation) are answered with the same "decline" the official clients send. Nothing is ever approved on your behalf; the agent sees an ordinary rejection and continues.
 
 The decoder intentionally keeps protocol payloads as tolerant `serde_json::Value` objects so adjacent Codex CLI versions can interoperate without binding Longwatch to every optional field.
 
@@ -86,10 +94,10 @@ Longwatch treats this as a small write-ahead protocol:
 
 1. Record the attempt locally.
 2. Persist `submissionUncertain = true` atomically.
-3. Only then call `turn/start`.
+3. Only then call `turn/start`, tagged with a fresh `clientUserMessageId` that is persisted with the marker.
 4. Clear the marker after a turn ID is acknowledged or thread state is reconciled.
 5. On restart, call `thread/resume` before any new submission.
-6. If Codex reports an in-progress or completed turn, adopt that authoritative state.
+6. If the latest turn carries our `clientUserMessageId`, adopt its authoritative state. If it carries a different one, the request never arrived and is sent again, instead of mistaking an older answer for the result.
 7. If the outcome still cannot be proven, enter a normal backoff instead of immediately duplicating the request.
 
 If the critical state cannot be written, Longwatch pauses **before** crossing the process boundary.
@@ -99,7 +107,7 @@ If the critical state cannot be written, Longwatch pauses **before** crossing th
 | Outcome | Longwatch behavior |
 | --- | --- |
 | `willRetry = true` | Keeps ownership with the current Codex turn; sends nothing extra |
-| Current high-demand notice | Quiet immediate continuation without a red retry alert |
+| Current high-demand notice | Re-queues on a fixed 10-second cadence without a red retry alert |
 | Codex internal retry limit exhausted | Starts the next external round after a short settle delay |
 | 429 / 502 / 503 / 504, overload text, transient process or stream loss | Conservative retry/backoff |
 | Empty successful reply | Retries up to the configured empty-reply limit |
@@ -111,6 +119,18 @@ The default application-level delay is:
 ```text
 delay(n) = min(30s × 1.7^(n-1), 10m) × random(0.85 … 1.15)
 ```
+
+The current high-demand notice follows a separate fixed cadence that mimics a
+person clicking send again after reading the error:
+
+```text
+delay = 10s × random(0.8 … 1.2)
+```
+
+Codex retries capacity errors internally five times at roughly 10–12 second
+intervals; the outer queue uses the same frequency, so it re-queues about every
+ten seconds after Codex exhausts its own attempts instead of hammering the
+endpoint in a tight loop.
 
 App-server connection recovery uses a separate bounded sequence: 5 seconds, 15 seconds, then 60 seconds.
 
@@ -130,10 +150,12 @@ Longwatch uses the operating system's standard configuration directory and atomi
 GPUI / TDesign shell
         │ commands + snapshots
         ▼
-QueueRuntime ── QueueMachine ── Retry classifier / wake detector
-        │
-        └── Codex app-server transport
-               └── stdio JSON-RPC + persistent thread reconciliation
+MultiSessionRuntime ── global FIFO waiting queue
+        │ 1–8 independent slots
+        ├── QueueRuntime ── QueueMachine ── classifier / wake detector
+        │         └── Codex app-server process ── persistent thread 1
+        └── QueueRuntime ── QueueMachine
+                  └── Codex app-server process ── persistent thread N
 
 Platform facade: notifications · tray · result opening · alerts · diagnostics
 Persistence: atomic config/state JSON · daily logs · crash reports
@@ -141,7 +163,7 @@ Persistence: atomic config/state JSON · daily logs · crash reports
 
 | Path | Responsibility |
 | --- | --- |
-| `src/runtime.rs` | Serialized controller, recovery protocol, deadlines, persistence boundaries |
+| `src/runtime.rs` | Multi-session scheduling, serialized workers, recovery protocol, deadlines, persistence boundaries |
 | `src/queue.rs` | Deterministic queue state machine and invariants |
 | `src/app_server.rs` | Codex app-server lifecycle and JSON-RPC transport |
 | `src/classifier.rs` | Retry, pause, and success classification |
@@ -153,7 +175,7 @@ Persistence: atomic config/state JSON · daily logs · crash reports
 ## Requirements
 
 - Windows 10 version 1809 or later, macOS 12 or later, or a modern Linux desktop.
-- A working `codex` executable available on `PATH`, or a configured Codex executable path.
+- A working `codex` executable available on `PATH`, or a `codexPath` entry in `config.json`.
 - An existing Codex sign-in/session. Longwatch does not perform authentication for you.
 
 ## Installation
@@ -189,21 +211,24 @@ Linux development additionally needs Fontconfig, X11/XCB, Wayland, EGL, and Open
 
 ## Usage
 
-1. Enter one real task for Codex.
-2. Optionally choose a working directory.
-3. Press `Ctrl+Enter` or click the primary action.
-4. Leave Longwatch running; it will keep the thread serialized and wait through retryable failures.
-5. Open the result from the completion notification, the app, or the Windows tray menu.
+1. Click **New task** (`Ctrl+N`), describe the task, and optionally pick its working folder from the composer.
+2. Press `Enter` (`Shift+Enter` adds a line break). The task starts at once when a lane is free; otherwise it waits under **Queued** in submission order.
+3. The sidebar shows every task's state: processing, waiting to retry with a countdown, queued with its position, paused, or finished.
+4. Select a task to read its conversation. Typing there continues the same Codex conversation; while the task is still running, the message waits and is sent when the current turn ends.
+5. The task header holds **Pause**, **Stop**, **Open in Codex**, and **Remove**; a task waiting to retry also offers **Retry now**.
 
-Advanced settings include a **Startup default message** that is placed in the composer on each fresh launch. Enable **Send after launch** to submit that non-empty message once automatically. While Longwatch stays open, subsequent messages reuse the same Codex conversation.
+**Settings** has the rest: how many tasks run at once (1–8), the busy phrases that trigger a re-queue, an optional message to send on launch, the request identity, the completion sound, and diagnostics.
 
-During an active task, task text and retry parameters are locked. Alert settings can still be changed live. **Pause** interrupts the current turn while keeping recoverable state. **Stop** only interrupts the current turn and keeps the conversation, so the next message continues that thread. A normal application exit clears the session association; the next launch starts fresh.
+Each running task uses its own `codex app-server` process, increasing CPU, memory, and Codex service request pressure. Start with 2 and raise it only when the machine and service limits can support it; the hard maximum is 8. A finished task releases its process; a follow-up reconnects and resumes the same thread.
+
+**Pause** interrupts the current turn and keeps recoverable state; **Continue** resumes it with a "continue where you left off" message. **Stop** ends the current turn and keeps the conversation, so the next message continues that thread. Exiting Longwatch stops every running and queued task; with the Windows tray available, closing the window only hides it.
 
 ## Privacy and safety
 
 - Longwatch runs locally and talks to the locally installed Codex CLI.
 - It inherits your existing `CODEX_HOME`, provider settings, and Codex authentication state.
 - It does not read, request, or store API keys.
+- By default requests identify as the official desktop app. Choose **Longwatch** under Settings → Request identity if you would rather have them attributed to Longwatch.
 - It does not include a WebView, Node runtime, local HTTP server, remote-control service, telemetry client, or account switcher.
 - The support report deliberately excludes task text, configuration files, environment variables, and credentials. It can include app/system versions, queue metadata, thread ID, a bounded reply/error preview, and recent Longwatch logs.
 
@@ -213,11 +238,11 @@ Review the local `config.json` and logs before sharing them publicly; they can c
 
 **Codex CLI unavailable**
 
-Run `codex --version` in your normal shell, then confirm the executable path in Advanced Settings. Longwatch inherits the environment from the process that launches it.
+Run `codex --version` in your normal shell, then check **Settings → Codex program**. To use a different executable, set `codexPath` in `config.json`. Longwatch inherits the environment from the process that launches it.
 
 **Longwatch keeps reconnecting**
 
-Open the log directory from Advanced Settings and inspect the latest `longwatch.log.*` file. App-server stderr and the connection/retry timeline are recorded there.
+Open **Settings → Diagnostics → Open logs** and inspect the latest `longwatch.log.*` file. App-server stderr and the connection/retry timeline are recorded there.
 
 **State-save warning**
 

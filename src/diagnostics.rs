@@ -14,7 +14,10 @@ use chrono::Local;
 
 use crate::queue::QueueSnapshot;
 
-const VERSION_TIMEOUT: Duration = Duration::from_secs(3);
+// npm installs `codex` behind a node shim that can take several seconds to
+// answer on a busy machine. Detection runs in the background, so waiting is
+// cheap.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const LOG_TAIL_BYTES: usize = 48 * 1024;
 const REPLY_PREVIEW_CHARS: usize = 2_000;
 

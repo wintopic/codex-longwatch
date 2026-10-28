@@ -26,10 +26,10 @@ use windows::{
                 DestroyWindow, DispatchMessageW, FindWindowExW, GetCursorPos, GetMessageW,
                 HWND_MESSAGE, IDI_APPLICATION, LoadIconW, MF_DISABLED, MF_GRAYED, MF_SEPARATOR,
                 MF_STRING, MSG, PostMessageW, PostThreadMessageW, RegisterClassW, SW_HIDE,
-                SW_RESTORE, SetForegroundWindow, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-                TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
-                WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_QUIT,
-                WM_RBUTTONUP, WNDCLASSW,
+                SW_RESTORE, SetForegroundWindow, ShowWindow, ShowWindowAsync, TPM_NONOTIFY,
+                TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+                WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+                WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
             },
         },
     },
@@ -128,17 +128,38 @@ pub fn install_tray(main_window: isize) -> Result<(), TrayError> {
 }
 
 /// Hide the main window while leaving the process and queue running.
+///
+/// Uses `ShowWindowAsync`: this is called from GPUI's should-close callback,
+/// and a synchronous `ShowWindow` would deliver activation and size messages
+/// back into GPUI while it is still borrowed.
 pub fn hide_window_to_tray(main_window: isize) {
     if main_window != 0 {
         unsafe {
-            let _ = ShowWindow(HWND(main_window as *mut c_void), SW_HIDE);
+            let _ = ShowWindowAsync(HWND(main_window as *mut c_void), SW_HIDE);
         }
     }
 }
 
 /// Restore and focus the main window.
+///
+/// The work is handed to the tray thread for the same reason as
+/// [`hide_window_to_tray`]; without a tray thread the restore is posted.
 pub fn show_window_from_tray(main_window: isize) {
-    restore_main_window(main_window);
+    let tray_window = TRAY_WINDOW.load(Ordering::Acquire);
+    if tray_window != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(tray_window as *mut c_void)),
+                TRAY_SHOW_MESSAGE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    } else if main_window != 0 {
+        unsafe {
+            let _ = ShowWindowAsync(HWND(main_window as *mut c_void), SW_RESTORE);
+        }
+    }
 }
 
 /// Ask a previously running instance to restore its hidden main window.
@@ -378,26 +399,14 @@ unsafe fn show_tray_menu(window: HWND) {
         let _ = AppendMenuW(menu, disabled, MENU_STATUS, PCWSTR(status.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_SHOW, w!("打开 Longwatch"));
-        let _ = AppendMenuW(
-            menu,
-            if state.control == TrayControl::Disabled {
-                disabled
-            } else {
-                MF_STRING
-            },
-            MENU_CONTROL,
-            PCWSTR(control.as_ptr()),
-        );
-        let _ = AppendMenuW(
-            menu,
-            if state.can_open_result {
-                MF_STRING
-            } else {
-                disabled
-            },
-            MENU_OPEN_RESULT,
-            w!("打开 Codex 结果"),
-        );
+        // Actions that cannot apply right now are left out rather than shown
+        // greyed out, so the menu only lists what the user can do.
+        if state.control != TrayControl::Disabled {
+            let _ = AppendMenuW(menu, MF_STRING, MENU_CONTROL, PCWSTR(control.as_ptr()));
+        }
+        if state.can_open_result {
+            let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN_RESULT, w!("打开 Codex 结果"));
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出"));
     }

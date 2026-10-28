@@ -32,7 +32,7 @@ mod tray;
 pub use completion_alert::{
     show_completion_overlay, show_retry_error_overlay, stop_completion_overlay,
 };
-pub use error_dialog::{confirm_exit_while_running, show_error_dialog};
+pub use error_dialog::show_error_dialog;
 pub use identity::{IdentityError, initialize_app_identity};
 #[cfg(target_os = "macos")]
 pub use macos_icon::sync_macos_app_icon;

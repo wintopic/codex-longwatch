@@ -1,201 +1,297 @@
-//! `TDesign` GPUI desktop shell.
+//! Longwatch desktop shell.
+//!
+//! The layout follows the Qoder workbench: a 40 px title bar and a sidebar on
+//! a tinted shell, next to one bordered content card. The sidebar *is* the
+//! queue — running, waiting and finished tasks — so the window answers "what
+//! is queued and how far along is it?" at a glance. Everything else (retry
+//! tuning, diagnostics) lives on the settings page.
 
 use std::{
     cell::RefCell,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use gpui::WindowAppearance;
+use chrono::{DateTime, Utc};
 use gpui::{
-    Animation, AnimationExt as _, App, Application, Bounds, ClipboardItem, Context, Entity,
-    EntityInputHandler, Focusable, FontWeight, Image, ImageFormat, Render, ScrollHandle, Stateful,
-    StyleRefinement, Timer, TitlebarOptions, Transformation, Window, WindowBounds,
-    WindowControlArea, WindowOptions, div, img, percentage, point, prelude::*, px, relative, rgb,
-    rgba, size, svg,
+    AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, Div, ElementId,
+    Entity, EntityInputHandler, Focusable, FontWeight, Image, ImageFormat, KeyDownEvent,
+    PathPromptOptions, Render, ScrollHandle, SharedString, Stateful, StyleRefinement, Timer,
+    TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions, div,
+    img, point, prelude::*, px, rgb, rgba, size,
 };
-use gpui_component::Root as ComponentRoot;
-use gpui_component::input::{Input as ThemedInput, InputState};
-use gpui_component::text::{TextView, TextViewStyle};
+use gpui_component::{
+    Root as ComponentRoot,
+    input::{Input, InputEvent, InputState},
+    text::{TextView, TextViewStyle},
+};
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tdesign_gpui::{
-    Icon, IconName, Switch, TDesignAssetSource, TDesignConfig, TDesignRoot, Tag, TagTheme,
-    ThemeMode, ThemeOverrides, ToggleState,
+    Icon, IconName, TDesignAssetSource, TDesignConfig, TDesignRoot, ThemeMode, ThemeOverrides,
 };
 use tracing::warn;
 
 use crate::{
-    config::{ConfigStore, QueueConfig},
+    config::{
+        ClientIdentity, ConfigStore, MAX_CONCURRENT_SESSIONS, MIN_CONCURRENT_SESSIONS, QueueConfig,
+    },
     diagnostics::{self, CodexCliInfo},
-    queue::{ConversationMessage, ConversationRole, PendingMessage, QueuePhase, QueueSnapshot},
+    queue::{
+        ConversationMessage, ConversationRole, PendingTaskSummary, QueuePhase, QueueSessionSummary,
+        QueueSnapshot,
+    },
     runtime::{RuntimeCommand, RuntimeHandle},
 };
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum CopyFeedback {
-    #[default]
-    Idle,
-    Copied,
-}
+const TITLEBAR_HEIGHT: f32 = 40.;
+const SIDEBAR_WIDTH: f32 = 256.;
+const CHAT_WIDTH: f32 = 720.;
+const CONTENT_RADIUS: f32 = 10.;
+const COMPOSER_RADIUS: f32 = 20.;
+/// Text column of a sidebar row: sidebar padding, row padding, indicator and
+/// gap removed. gpui only ellipsizes text whose width is known up front.
+const ROW_TEXT_WIDTH: f32 = SIDEBAR_WIDTH - 16. - 16. - 14. - 9.;
 
-// Longwatch follows a small, deliberately boring visual language: an 8px
-// spacing rhythm, quiet surfaces, and one shared panel radius. Keeping these
-// values together makes the desktop shell feel like one product instead of a
-// collection of individually styled widgets.
-const PANEL_RADIUS: f32 = 10.;
-const INNER_RADIUS: f32 = 8.;
-const CANVAS_COLOR: u32 = 0xf5f6f5;
-const PANEL_BORDER: u32 = 0xdfe5e2;
-const SOFT_BORDER: u32 = 0xe7ebe9;
-const TEXT_PRIMARY: u32 = 0x252a28;
-const TEXT_SECONDARY: u32 = 0x68716d;
-const TEXT_MUTED: u32 = 0x929a96;
-const BRAND_COLOR: u32 = 0x16a673;
-
-/// Colors owned by the application shell. `TDesign` and `gpui-component` already
-/// have system-aware palettes, but the dashboard is intentionally built from
-/// plain GPUI primitives. Keeping its colors in one small palette prevents a
-/// Windows dark-mode switch from leaving light cards and a light composer
-/// behind a dark code block.
+/// Qoder's "light" and "forest-dark" tokens, flattened to the handful of
+/// roles this window uses.
 #[derive(Clone, Copy, Debug)]
-struct UiPalette {
+struct Palette {
     dark: bool,
-    canvas: u32,
+    shell: u32,
     surface: u32,
-    surface_alt: u32,
-    surface_subtle: u32,
-    border: u32,
-    border_soft: u32,
-    divider: u32,
+    elevated: u32,
+    base: u32,
+    fill_secondary: u32,
     text: u32,
     text_secondary: u32,
-    text_muted: u32,
-    user_bubble: u32,
-    user_text: u32,
-    hover: u32,
-    action: u32,
-    action_text: u32,
-    brand: u32,
-    brand_soft: u32,
+    text_tertiary: u32,
+    text_quaternary: u32,
+    border_secondary: u32,
+    border_tertiary: u32,
+    primary: u32,
+    primary_hover: u32,
+    primary_bg: u32,
+    primary_border: u32,
+    primary_text: u32,
+    on_primary: u32,
+    success: u32,
+    warning: u32,
     error: u32,
-    error_soft: u32,
-    warning_soft: u32,
-    success_soft: u32,
-    inactive: u32,
-    inactive_border: u32,
-    overlay: u32,
+    error_bg: u32,
+    switch_off: u32,
+    /// RGBA overlays for sidebar rows, drawn over the shell.
+    hover: u32,
+    active: u32,
+    mask: u32,
 }
 
-impl UiPalette {
+impl Palette {
     fn for_window(window: &Window) -> Self {
-        Self::for_dark(matches!(
+        // Debug builds can preview either palette without changing the OS
+        // theme, matching the LONGWATCH_CONFIG_DIR override for previews.
+        #[cfg(debug_assertions)]
+        match std::env::var("LONGWATCH_FORCE_THEME").as_deref() {
+            Ok("dark") => return Self::dark(),
+            Ok("light") => return Self::light(),
+            _ => {}
+        }
+        if matches!(
             window.appearance(),
             WindowAppearance::Dark | WindowAppearance::VibrantDark
-        ))
+        ) {
+            Self::dark()
+        } else {
+            Self::light()
+        }
     }
 
-    fn for_dark(dark: bool) -> Self {
-        if dark {
-            Self {
-                dark,
-                canvas: 0x171b19,
-                surface: 0x202622,
-                surface_alt: 0x252d28,
-                surface_subtle: 0x1c221f,
-                border: 0x3b4841,
-                border_soft: 0x303b35,
-                divider: 0x344039,
-                text: 0xe9f0ec,
-                text_secondary: 0xaab8b0,
-                text_muted: 0x829089,
-                user_bubble: 0x304038,
-                user_text: 0xe7efea,
-                hover: 0x2d3932,
-                action: 0x3b4741,
-                action_text: 0xf5faf7,
-                brand: 0x43c997,
-                brand_soft: 0x1f4c3b,
-                error: 0xff958a,
-                error_soft: 0x4b2927,
-                warning_soft: 0x4a3523,
-                success_soft: 0x214a3a,
-                inactive: 0x2a332e,
-                inactive_border: 0x435049,
-                overlay: 0x00000099,
-            }
-        } else {
-            Self {
-                dark,
-                canvas: CANVAS_COLOR,
-                surface: 0xffffff,
-                surface_alt: 0xf9fbfa,
-                surface_subtle: 0xf8faf9,
-                border: PANEL_BORDER,
-                border_soft: SOFT_BORDER,
-                divider: 0xe7e7e7,
-                text: TEXT_PRIMARY,
-                text_secondary: TEXT_SECONDARY,
-                text_muted: TEXT_MUTED,
-                user_bubble: 0xf4f4f4,
-                user_text: 0x2f2f2f,
-                hover: 0xf0f4f2,
-                action: 0x2f3432,
-                action_text: 0xffffff,
-                brand: BRAND_COLOR,
-                brand_soft: 0xe8f8f0,
-                error: 0xc23b33,
-                error_soft: 0xfff5f3,
-                warning_soft: 0xfff7f0,
-                success_soft: 0xf4faf7,
-                inactive: 0xe9eeeb,
-                inactive_border: 0xdce2df,
-                overlay: 0x0000004d,
-            }
+    const fn light() -> Self {
+        Self {
+            dark: false,
+            shell: 0xf6f6f6,
+            surface: 0xffffff,
+            elevated: 0xf9f9f9,
+            base: 0xffffff,
+            fill_secondary: 0xefefef,
+            text: 0x141414,
+            text_secondary: 0x636261,
+            text_tertiary: 0x838280,
+            text_quaternary: 0xaaa9a8,
+            border_secondary: 0xdddddd,
+            border_tertiary: 0xe6e6e6,
+            primary: 0x4b6f5a,
+            primary_hover: 0x436651,
+            primary_bg: 0xf2f4f2,
+            primary_border: 0xd5dbd8,
+            primary_text: 0x4b6f5a,
+            on_primary: 0xfdfdfd,
+            success: 0x579b6e,
+            warning: 0xefb041,
+            error: 0xec5b56,
+            error_bg: 0xfdf2f0,
+            switch_off: 0xdfdfdf,
+            hover: 0x0000_000a,
+            active: 0x0000_0012,
+            mask: 0x9595_9466,
         }
+    }
+
+    const fn dark() -> Self {
+        Self {
+            dark: true,
+            shell: 0x242624,
+            surface: 0x191b1a,
+            elevated: 0x252825,
+            base: 0x222523,
+            fill_secondary: 0x2d332e,
+            text: 0xd9dcd9,
+            text_secondary: 0xb3bab4,
+            text_tertiary: 0x949d96,
+            text_quaternary: 0x8a948c,
+            border_secondary: 0x404842,
+            border_tertiary: 0x363c37,
+            primary: 0x4d9c61,
+            primary_hover: 0x62ad78,
+            primary_bg: 0x14261c,
+            primary_border: 0x335942,
+            primary_text: 0x8ee5a1,
+            on_primary: 0x080807,
+            success: 0x73cd94,
+            warning: 0xfaad14,
+            error: 0xff4d4f,
+            error_bg: 0x4a1a1b,
+            switch_off: 0x6e736f,
+            hover: 0x2c31_2dff,
+            active: 0x343b_35ff,
+            mask: 0x0000_0099,
+        }
+    }
+
+    /// Qoder's `natural-shadow-sm`; dark surfaces separate by tone alone.
+    fn soft_shadow(self) -> Vec<BoxShadow> {
+        if self.dark {
+            return Vec::new();
+        }
+        vec![
+            BoxShadow {
+                color: rgba(0x0000_000a).into(),
+                offset: point(px(0.), px(1.)),
+                blur_radius: px(1.),
+                spread_radius: px(0.),
+            },
+            BoxShadow {
+                color: rgba(0x0000_0014).into(),
+                offset: point(px(0.), px(4.)),
+                blur_radius: px(12.),
+                spread_radius: px(-6.),
+            },
+        ]
+    }
+
+    fn overlay_shadow(self) -> Vec<BoxShadow> {
+        vec![BoxShadow {
+            color: rgba(if self.dark { 0x0000_0066 } else { 0x0000_0024 }).into(),
+            offset: point(px(0.), px(12.)),
+            blur_radius: px(32.),
+            spread_radius: px(-8.),
+        }]
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Selection {
+    New,
+    Session(u64),
+    Pending(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Page {
+    Queue,
+    Settings,
+}
+
+/// What the composer does with its text for the current selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposerTarget {
+    NewTask,
+    FollowUp { session_id: u64, running: bool },
+    Blocked(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ButtonStyle {
+    Ghost,
+    Outline,
+    Primary,
+    DangerGhost,
+    Danger,
+}
+
+#[derive(Clone, Debug)]
+struct Notice {
+    id: u64,
+    text: String,
+    error: bool,
+}
+
+// Independent view flags (copy feedback, dialogs, validation) rather than a
+// state machine.
+#[allow(clippy::struct_excessive_bools)]
 struct QueueView {
     config: QueueConfig,
     snapshot: QueueSnapshot,
     commands: tokio::sync::mpsc::Sender<RuntimeCommand>,
+    selection: Selection,
+    /// The first snapshots after launch may arrive before the scheduler has
+    /// restored anything; the initial selection waits for real sessions.
+    initial_selection_pending: bool,
+    requested_session: Option<u64>,
+    page: Page,
     prompt_input: Entity<InputState>,
     default_prompt_input: Entity<InputState>,
-    cwd_input: Entity<InputState>,
     phrases_input: Entity<InputState>,
-    auto_send_toggle: Entity<ToggleState>,
-    full_screen_toggle: Entity<ToggleState>,
-    audio_toggle: Entity<ToggleState>,
-    logo_image: Arc<Image>,
-    codex_cli: CodexCliInfo,
-    advanced_open: bool,
-    route_motion_frame: u8,
-    celebration_burst_id: u64,
-    prompt_error: bool,
+    placeholder: &'static str,
+    /// `None` while `codex --version` is still running in the background.
+    codex_cli: Option<CodexCliInfo>,
+    logo: Arc<Image>,
     next_request_id: u64,
-    pending_clear_request: Option<u64>,
-    pending_clear_text: Option<String>,
-    conversation_scroll: ScrollHandle,
-    copy_feedback: CopyFeedback,
-    diagnostic_copy_feedback: CopyFeedback,
+    /// Submission whose text was cleared optimistically, restored if rejected.
+    pending_clear: Option<(u64, String)>,
+    /// New task whose placement (session or waiting slot) is still unknown.
+    awaiting_placement: Option<u64>,
+    prompt_error: bool,
+    timeline_scroll: ScrollHandle,
+    reply_copied: bool,
+    diagnostics_copied: bool,
+    notice: Option<Notice>,
+    notice_counter: u64,
+    exit_confirm_open: bool,
+    closing: Arc<AtomicBool>,
+    runtime_stopped: bool,
+    last_slow_refresh: Instant,
+    /// Width available to a content header, refreshed on every render.
+    header_space: f32,
+    #[cfg(target_os = "windows")]
+    tray_status: String,
     config_directory: PathBuf,
     logs_directory: PathBuf,
+    _subscriptions: Vec<gpui::Subscription>,
     #[allow(dead_code)] // Stored for its lifetime; dropping it stops theme-change callbacks.
     appearance_subscription: Option<gpui::Subscription>,
 }
 
 impl QueueView {
     fn send(&self, command: RuntimeCommand) -> bool {
-        // UI callbacks run on GPUI's executor, not necessarily inside a
-        // Tokio reactor.  A synchronous bounded send avoids spawning a Tokio
-        // future during window teardown (which used to trigger "there is no
-        // reactor running" on the final tray callback).
+        // UI callbacks run on GPUI's executor, not necessarily inside a Tokio
+        // reactor. A synchronous bounded send avoids spawning a Tokio future
+        // during window teardown.
         self.commands.try_send(command).is_ok()
     }
 
@@ -203,189 +299,448 @@ impl QueueView {
         let _ = self.send(RuntimeCommand::Configure(self.config.clone()));
     }
 
-    fn start_now(&mut self, prompt: String, cwd: String, phrases: String, _cx: &mut Context<Self>) {
-        if self.pending_clear_request.is_some() {
-            return;
-        }
-        if prompt.trim().is_empty() {
-            self.prompt_error = true;
-            return;
-        }
-        self.prompt_error = false;
-        gpui_platform::stop_completion_overlay();
-        let submitted_prompt = prompt.clone();
-        self.config.prompt = prompt;
-        self.config.working_directory = (!cwd.trim().is_empty()).then(|| PathBuf::from(cwd.trim()));
-        self.config.failure_phrases = phrases
-            .split('|')
-            .map(str::trim)
-            .filter(|phrase| !phrase.is_empty())
-            .map(str::to_owned)
-            .collect();
-        let request_id = self.allocate_request_id();
-        if self.send(RuntimeCommand::SubmitConfigured {
-            config: self.config.clone(),
-            request_id,
-        }) {
-            self.pending_clear_request = Some(request_id);
-            self.pending_clear_text = Some(submitted_prompt);
-        }
-    }
-
-    fn queue_message_now(
-        &mut self,
-        prompt: String,
-        cwd: String,
-        phrases: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.pending_clear_request.is_some() {
-            return;
-        }
-        if prompt.trim().is_empty() {
-            self.prompt_error = true;
-            return;
-        }
-        self.prompt_error = false;
-        let message = PendingMessage {
-            prompt,
-            working_directory: (!cwd.trim().is_empty()).then(|| PathBuf::from(cwd.trim())),
-            failure_phrases: phrases
-                .split('|')
-                .map(str::trim)
-                .filter(|phrase| !phrase.is_empty())
-                .map(str::to_owned)
-                .collect(),
-        };
-        let request_id = self.allocate_request_id();
-        if self.send(RuntimeCommand::QueueMessageWithAck {
-            message,
-            request_id,
-        }) {
-            self.pending_clear_request = Some(request_id);
-            self.pending_clear_text = Some(self.prompt_input.read(cx).value().to_string());
-        }
-    }
-
     fn allocate_request_id(&mut self) -> u64 {
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         self.next_request_id
     }
 
-    fn resume_now(&mut self, cx: &mut Context<Self>) {
-        self.prompt_error = false;
-        gpui_platform::stop_completion_overlay();
-        let _ = self.send(RuntimeCommand::Resume);
-        cx.notify();
+    fn summary(&self, id: u64) -> Option<&QueueSessionSummary> {
+        self.snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == id && session.has_history)
     }
 
-    fn stop_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        gpui_platform::stop_completion_overlay();
-        let prompt = self.config.prompt.clone();
-        self.prompt_input.update(cx, |state, cx| {
-            state.set_value(prompt, window, cx);
-        });
-        self.prompt_error = false;
-        self.pending_clear_request = None;
-        self.pending_clear_text = None;
-        let _ = self.send(RuntimeCommand::Stop);
+    /// Full details are only published for the session the runtime has
+    /// selected; anything else shows its summary until the switch lands.
+    fn detail(&self, id: u64) -> Option<&QueueSnapshot> {
+        (self.snapshot.session_id == Some(id)).then_some(&self.snapshot)
     }
 
-    fn set_auto_send_default(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.save_default_prompt_from_input(cx);
-        self.config.auto_send_default_prompt = enabled;
-        self.configure();
-        cx.notify();
+    fn pending_follow_up_for(&self, session_id: u64) -> Option<&PendingTaskSummary> {
+        self.snapshot
+            .pending_tasks
+            .iter()
+            .find(|task| task.target_session_id == Some(session_id))
     }
 
-    fn set_full_screen(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.config.full_screen_flash_enabled = enabled;
-        if !enabled {
-            gpui_platform::stop_completion_overlay();
+    /// Width of the conversation column. It is set explicitly: replies can
+    /// contain long unbreakable runs whose min-content width would otherwise
+    /// stretch the composer past the card.
+    fn chat_width(&self) -> f32 {
+        (self.header_space + 32. - 56.).clamp(320., CHAT_WIDTH)
+    }
+
+    fn has_active_work(&self) -> bool {
+        self.snapshot.running_session_count > 0 || !self.snapshot.pending_tasks.is_empty()
+    }
+
+    fn select(&mut self, selection: Selection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page == Page::Settings {
+            self.save_text_settings(cx);
+            self.page = Page::Queue;
         }
-        self.configure();
+        if self.selection != selection {
+            self.selection = selection;
+            self.reply_copied = false;
+            self.prompt_error = false;
+            self.timeline_scroll.scroll_to_bottom();
+        }
+        self.initial_selection_pending = false;
+        if let Selection::Session(id) = selection {
+            self.request_runtime_selection(id);
+        }
+        self.sync_placeholder(window, cx);
         cx.notify();
     }
 
-    fn set_audio_alert(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.config.audio_alert_enabled = enabled;
-        self.configure();
+    fn start_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Selection::New, window, cx);
+        self.prompt_input
+            .update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    fn request_runtime_selection(&mut self, id: u64) {
+        if self.snapshot.session_id != Some(id)
+            && self.requested_session != Some(id)
+            && self.send(RuntimeCommand::SelectSession(id))
+        {
+            self.requested_session = Some(id);
+        }
+    }
+
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.page = Page::Settings;
         cx.notify();
     }
 
-    fn trigger_success_burst(&mut self, cx: &mut Context<Self>) {
-        if self.snapshot.phase == QueuePhase::Success {
-            self.celebration_burst_id = self.celebration_burst_id.wrapping_add(1);
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.save_text_settings(cx);
+        self.page = Page::Queue;
+        cx.notify();
+    }
+
+    fn composer_target(&self) -> ComposerTarget {
+        match self.selection {
+            Selection::New | Selection::Pending(_) => ComposerTarget::NewTask,
+            Selection::Session(id) => {
+                let Some(detail) = self.detail(id) else {
+                    return ComposerTarget::Blocked("正在载入任务…");
+                };
+                let running = self.summary(id).is_some_and(|summary| summary.active);
+                if detail.phase == QueuePhase::Paused {
+                    ComposerTarget::Blocked("任务已暂停，继续或停止后才能追加消息")
+                } else if detail.phase == QueuePhase::FatalError {
+                    ComposerTarget::Blocked("请先重试或停止这个任务")
+                } else if detail.queued_message.is_some()
+                    || self.pending_follow_up_for(id).is_some()
+                {
+                    ComposerTarget::Blocked("已有一条追加消息在等待发送")
+                } else {
+                    ComposerTarget::FollowUp {
+                        session_id: id,
+                        running,
+                    }
+                }
+            }
+        }
+    }
+
+    fn sync_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = match self.composer_target() {
+            ComposerTarget::NewTask => "描述要交给 Codex 的任务，按 Enter 加入队列",
+            ComposerTarget::FollowUp { running: true, .. } => {
+                "补充一条消息，当前回合结束后自动发送"
+            }
+            ComposerTarget::FollowUp { running: false, .. } => "继续这个会话，按 Enter 发送",
+            ComposerTarget::Blocked(reason) => reason,
+        };
+        if placeholder != self.placeholder {
+            self.placeholder = placeholder;
+            self.prompt_input.update(cx, |state, cx| {
+                state.set_placeholder(placeholder, window, cx)
+            });
+        }
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = self.prompt_input.read(cx).value().to_string();
+        let target = self.composer_target();
+        if matches!(target, ComposerTarget::Blocked(_)) {
+            return;
+        }
+        if prompt.trim().is_empty() {
+            self.prompt_error = true;
+            cx.notify();
+            return;
+        }
+        self.prompt_error = false;
+        let request_id = self.allocate_request_id();
+        let sent = match target {
+            ComposerTarget::NewTask => {
+                let config = QueueConfig {
+                    prompt: prompt.clone(),
+                    working_directory: self.config.default_working_directory.clone(),
+                    ..self.config.clone()
+                };
+                let sent = self.send(RuntimeCommand::StartNewConfigured { config, request_id });
+                if sent {
+                    self.awaiting_placement = Some(request_id);
+                }
+                sent
+            }
+            ComposerTarget::FollowUp { session_id, .. } => {
+                // Follow-ups stay in the conversation's own folder.
+                let config = QueueConfig {
+                    prompt: prompt.clone(),
+                    working_directory: self.snapshot.session_working_directory.clone(),
+                    ..self.config.clone()
+                };
+                self.request_runtime_selection(session_id);
+                self.send(RuntimeCommand::SubmitConfigured { config, request_id })
+            }
+            ComposerTarget::Blocked(_) => false,
+        };
+        if sent {
+            self.pending_clear = Some((request_id, prompt));
+            self.prompt_input
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.timeline_scroll.scroll_to_bottom();
+        } else {
+            self.show_notice("后台没有响应，请稍后再试", true, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn run_selected(&mut self, command: RuntimeCommand, cx: &mut Context<Self>) {
+        if let Selection::Session(id) = self.selection {
+            self.request_runtime_selection(id);
+            let _ = self.send(command);
             cx.notify();
         }
     }
 
-    fn toggle_advanced_now(&mut self, cx: &mut Context<Self>) {
-        if self.advanced_open {
-            self.save_default_prompt_from_input(cx);
+    fn dismiss_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Selection::Session(id) = self.selection {
+            let _ = self.send(RuntimeCommand::DismissSession(id));
+            self.select(Selection::New, window, cx);
         }
-        self.advanced_open = !self.advanced_open;
+    }
+
+    fn cancel_pending(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.send(RuntimeCommand::CancelPending(id));
+        if self.selection == Selection::Pending(id) {
+            self.select(Selection::New, window, cx);
+        }
         cx.notify();
     }
 
-    fn save_default_prompt_from_input(&mut self, cx: &mut Context<Self>) {
-        let default_prompt = self.default_prompt_input.read(cx).value().to_string();
-        if default_prompt != self.config.default_prompt {
-            self.config.default_prompt = default_prompt;
-            self.configure();
+    fn clear_finished(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.send(RuntimeCommand::ClearFinished);
+        if let Selection::Session(id) = self.selection
+            && self.summary(id).is_some_and(session_is_finished)
+        {
+            self.select(Selection::New, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn selected_thread_id(&self) -> Option<String> {
+        match self.selection {
+            Selection::Session(id) => self.summary(id)?.active_thread_id.clone(),
+            _ => None,
         }
     }
 
-    fn open_thread_now(&mut self) {
-        gpui_platform::stop_completion_overlay();
-        if let Some(thread_id) = self.snapshot.active_thread_id.as_deref() {
-            if let Err(error) =
-                gpui_platform::open_thread(thread_id, &self.config.codex_path.to_string_lossy())
-            {
-                gpui_platform::show_error_dialog("无法打开 Codex 结果", &error.to_string());
-            }
+    fn open_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.selected_thread_id() else {
+            return;
+        };
+        if let Err(error) =
+            gpui_platform::open_thread(&thread_id, &self.config.codex_path.to_string_lossy())
+        {
+            warn!(%error, "无法打开 Codex 会话");
+            self.show_notice(format!("无法打开 Codex：{error}"), true, window, cx);
         }
     }
 
     fn copy_reply(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.copy_feedback = CopyFeedback::Copied;
-        let view = cx.entity();
-        cx.spawn_in(window, async move |_, cx| {
+        self.reply_copied = true;
+        cx.spawn_in(window, async move |view, cx| {
             Timer::after(Duration::from_millis(1400)).await;
             let _ = view.update(cx, |view, cx| {
-                view.copy_feedback = CopyFeedback::Idle;
+                view.reply_copied = false;
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
-    }
-
-    fn open_logs_now(&self) {
-        if let Err(error) = gpui_platform::open_directory(&self.logs_directory) {
-            gpui_platform::show_error_dialog("无法打开日志目录", &error.to_string());
-        }
     }
 
     fn copy_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let report = diagnostics::build_support_report(
-            &self.config_directory,
-            &self.codex_cli,
-            &self.snapshot,
-        );
+        let cli = self.codex_cli.clone().unwrap_or_else(|| CodexCliInfo {
+            requested_path: self.config.codex_path.clone(),
+            resolved_path: None,
+            version: None,
+            error: Some("仍在检测".into()),
+        });
+        let report =
+            diagnostics::build_support_report(&self.config_directory, &cli, &self.snapshot);
         cx.write_to_clipboard(ClipboardItem::new_string(report));
-        self.diagnostic_copy_feedback = CopyFeedback::Copied;
-        let view = cx.entity();
-        cx.spawn_in(window, async move |_, cx| {
+        self.diagnostics_copied = true;
+        cx.spawn_in(window, async move |view, cx| {
             Timer::after(Duration::from_millis(1600)).await;
             let _ = view.update(cx, |view, cx| {
-                view.diagnostic_copy_feedback = CopyFeedback::Idle;
+                view.diagnostics_copied = false;
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    fn open_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = gpui_platform::open_directory(&self.logs_directory) {
+            self.show_notice(format!("无法打开日志目录：{error}"), true, window, cx);
+        }
+    }
+
+    fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择任务的工作目录".into()),
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.config.default_working_directory = Some(path);
+                view.configure();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn clear_folder(&mut self, cx: &mut Context<Self>) {
+        self.config.default_working_directory = None;
+        self.configure();
+        cx.notify();
+    }
+
+    fn adjust_concurrency(&mut self, delta: i16, cx: &mut Context<Self>) {
+        let next = (i16::from(self.config.max_concurrent_sessions) + delta).clamp(
+            i16::from(MIN_CONCURRENT_SESSIONS),
+            i16::from(MAX_CONCURRENT_SESSIONS),
+        );
+        let next = u8::try_from(next).unwrap_or(MIN_CONCURRENT_SESSIONS);
+        if next != self.config.max_concurrent_sessions {
+            self.config.max_concurrent_sessions = next;
+            self.configure();
+            cx.notify();
+        }
+    }
+
+    fn set_identity(&mut self, identity: ClientIdentity, cx: &mut Context<Self>) {
+        if self.config.client_identity != identity {
+            self.config.client_identity = identity;
+            self.configure();
+            cx.notify();
+        }
+    }
+
+    fn toggle_audio(&mut self, cx: &mut Context<Self>) {
+        self.config.audio_alert_enabled = !self.config.audio_alert_enabled;
+        self.configure();
+        cx.notify();
+    }
+
+    fn toggle_auto_send(&mut self, cx: &mut Context<Self>) {
+        self.save_text_settings(cx);
+        self.config.auto_send_default_prompt = !self.config.auto_send_default_prompt;
+        self.configure();
+        cx.notify();
+    }
+
+    fn save_text_settings(&mut self, cx: &mut Context<Self>) {
+        let default_prompt = self.default_prompt_input.read(cx).value().to_string();
+        let failure_phrases = parse_phrases(&self.phrases_input.read(cx).value());
+        if default_prompt != self.config.default_prompt
+            || failure_phrases != self.config.failure_phrases
+        {
+            self.config.default_prompt = default_prompt;
+            self.config.failure_phrases = failure_phrases;
+            self.configure();
+        }
+    }
+
+    fn confirm_exit(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        self.closing.store(true, Ordering::Release);
+        window.remove_window();
+    }
+
+    fn show_notice(
+        &mut self,
+        text: impl Into<String>,
+        error: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.notice_counter = self.notice_counter.wrapping_add(1);
+        let id = self.notice_counter;
+        self.notice = Some(Notice {
+            id,
+            text: text.into(),
+            error,
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            Timer::after(Duration::from_millis(3600)).await;
+            let _ = view.update(cx, |view, cx| {
+                if view.notice.as_ref().is_some_and(|notice| notice.id == id) {
+                    view.notice = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let modifiers = &event.keystroke.modifiers;
+        if key == "escape" {
+            if self.exit_confirm_open {
+                self.exit_confirm_open = false;
+                cx.notify();
+                cx.stop_propagation();
+            } else if self.page == Page::Settings {
+                self.close_settings(cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if self.exit_confirm_open {
+            return;
+        }
+        if key == "n" && modifiers.secondary() && !modifiers.shift && !modifiers.alt {
+            self.start_new_task(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if !matches!(key, "enter" | "return") || self.page != Page::Queue {
+            return;
+        }
+        if !self.prompt_input.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        // Enter that confirms an IME candidate must never submit the task.
+        let composing = self.prompt_input.update(cx, |state, cx| {
+            <InputState as EntityInputHandler>::marked_text_range(state, window, cx).is_some()
+        });
+        if composing {
+            return;
+        }
+        let plain = !modifiers.modified();
+        let shortcut = modifiers.secondary() && !modifiers.shift;
+        if plain || shortcut {
+            self.submit(window, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "windows")]
+        if let Some(action) = gpui_platform::take_tray_action() {
+            match action {
+                gpui_platform::TrayAction::Pause => {
+                    let _ = self.send(RuntimeCommand::Pause);
+                }
+                gpui_platform::TrayAction::Resume => {
+                    let _ = self.send(RuntimeCommand::Resume);
+                }
+                gpui_platform::TrayAction::OpenResult => self.open_thread(window, cx),
+            }
+            cx.notify();
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = window;
+        // Countdowns change every second; elapsed-time labels per minute.
+        let countdown = self.snapshot.sessions.iter().any(|session| {
+            session.next_attempt_at.is_some()
+                && matches!(session.phase, QueuePhase::Backoff | QueuePhase::Connecting)
+        });
+        if countdown || self.last_slow_refresh.elapsed() >= Duration::from_secs(20) {
+            self.last_slow_refresh = Instant::now();
+            cx.notify();
+        }
     }
 
     fn update_snapshot(
@@ -394,1250 +749,1947 @@ impl QueueView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .pending_clear_request
-            .is_some_and(|request_id| snapshot.accepted_request_id == request_id)
-        {
-            let submitted_text = self.pending_clear_text.take();
-            let current_text = self.prompt_input.read(cx).value().to_string();
-            if submitted_text.as_deref() == Some(current_text.as_str()) {
-                self.prompt_input.update(cx, |state, cx| {
-                    state.set_value("", window, cx);
-                });
+        if let Some((request_id, text)) = self.pending_clear.clone() {
+            if snapshot.accepted_request_id >= request_id {
+                self.pending_clear = None;
+            } else if snapshot.processed_request_id >= request_id {
+                // Rejected: put the text back unless the user typed again.
+                self.pending_clear = None;
+                if self.prompt_input.read(cx).value().is_empty() {
+                    self.prompt_input
+                        .update(cx, |state, cx| state.set_value(text, window, cx));
+                }
+                let reason = snapshot.status_message.trim();
+                if !reason.is_empty() {
+                    self.show_notice(reason.to_owned(), true, window, cx);
+                }
             }
-            self.pending_clear_request = None;
-            self.prompt_error = false;
         }
-        let entered_success =
-            self.snapshot.phase != QueuePhase::Success && snapshot.phase == QueuePhase::Success;
-        let conversation_changed = self.snapshot.reply_preview != snapshot.reply_preview
-            || self.snapshot.status_message != snapshot.status_message
+        if let Some(request_id) = self.awaiting_placement {
+            match snapshot.last_submission {
+                Some(placement) if placement.request_id == request_id => {
+                    self.awaiting_placement = None;
+                    if let Some(session_id) = placement.session_id {
+                        self.selection = Selection::Session(session_id);
+                    } else if let Some(pending_id) = placement.pending_id {
+                        self.selection = Selection::Pending(pending_id);
+                    }
+                }
+                _ if snapshot.processed_request_id >= request_id
+                    && snapshot.accepted_request_id < request_id =>
+                {
+                    self.awaiting_placement = None;
+                }
+                _ => {}
+            }
+        }
+
+        let max_scroll = self.timeline_scroll.max_offset().height;
+        let distance_from_bottom = max_scroll + self.timeline_scroll.offset().y;
+        let should_follow = max_scroll <= px(1.) || distance_from_bottom <= px(32.);
+        let content_changed = self.snapshot.session_id != snapshot.session_id
+            || self.snapshot.conversation.len() != snapshot.conversation.len()
+            || self.snapshot.reply_preview != snapshot.reply_preview
             || self.snapshot.phase != snapshot.phase;
-        let max_scroll = self.conversation_scroll.max_offset().height;
-        let distance_from_bottom = max_scroll + self.conversation_scroll.offset().y;
-        let should_follow = max_scroll <= px(1.) || distance_from_bottom <= px(24.);
-        let retry_alerts = snapshot
-            .retry_alert_count
-            .saturating_sub(self.snapshot.retry_alert_count)
-            .min(16);
-        if conversation_changed {
-            self.copy_feedback = CopyFeedback::Idle;
-        }
-        if entered_success {
-            self.celebration_burst_id = self.celebration_burst_id.wrapping_add(1);
+        if self.snapshot.phase != snapshot.phase || self.snapshot.session_id != snapshot.session_id
+        {
+            self.reply_copied = false;
         }
         self.snapshot = snapshot;
-        if should_follow && conversation_changed {
-            self.conversation_scroll.scroll_to_bottom();
+        if self.snapshot.session_id == self.requested_session {
+            self.requested_session = None;
+        }
+        self.reconcile_selection();
+        if let Selection::Session(id) = self.selection {
+            self.request_runtime_selection(id);
+        }
+        if should_follow && content_changed {
+            self.timeline_scroll.scroll_to_bottom();
         }
         #[cfg(target_os = "windows")]
-        update_tray_state(&self.snapshot);
-        if retry_alerts > 0 && self.config.full_screen_flash_enabled {
-            for _ in 0..retry_alerts {
-                gpui_platform::show_retry_error_overlay();
+        self.update_tray();
+        self.sync_placeholder(window, cx);
+        cx.notify();
+    }
+
+    /// Keep the selection pointing at something that still exists, following a
+    /// waiting task into the session it was started in.
+    fn reconcile_selection(&mut self) {
+        if self.initial_selection_pending && !self.snapshot.sessions.is_empty() {
+            self.initial_selection_pending = false;
+            if self.selection == Selection::New
+                && let Some(session) = self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .filter(|session| session.has_history)
+                    .max_by_key(|session| session.active)
+            {
+                self.selection = Selection::Session(session.id);
             }
         }
-        cx.notify();
+        match self.selection {
+            Selection::New => {}
+            Selection::Session(id) => {
+                if self.summary(id).is_none() {
+                    self.selection = Selection::New;
+                }
+            }
+            Selection::Pending(pending_id) => {
+                if !self
+                    .snapshot
+                    .pending_tasks
+                    .iter()
+                    .any(|task| task.id == pending_id)
+                {
+                    self.selection = self
+                        .snapshot
+                        .sessions
+                        .iter()
+                        .find(|session| session.origin_pending_id == Some(pending_id))
+                        .map_or(Selection::New, |session| Selection::Session(session.id));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn update_tray(&mut self) {
+        let status = tray_status(&self.snapshot);
+        if status != self.tray_status {
+            gpui_platform::set_tray_state(&status, gpui_platform::TrayControl::Disabled, false);
+            self.tray_status = status;
+        }
     }
 }
 
 impl Render for QueueView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = UiPalette::for_window(window);
-        let phase = friendly_phase(self.snapshot.phase);
-        let next = next_attempt_label(self.snapshot.next_attempt_at);
-        let primary_label = primary_action_label(self.snapshot.phase);
-        let phase_accent = phase_color(self.snapshot.phase, palette);
-        let has_runtime_warning = self.snapshot.runtime_warning.is_some();
-        let phase_detail = self.snapshot.runtime_warning.clone().unwrap_or_else(|| {
-            phase_detail(
-                self.snapshot.phase,
-                next.as_deref(),
-                self.snapshot.consecutive_retries,
-            )
-        });
-        let diagnostic_ok = self.codex_cli.available();
-        let cli_status = if diagnostic_ok {
-            format!("{} · 可用", self.codex_cli.version_label())
-        } else {
-            "Codex CLI 不可用".into()
-        };
-        let transport_status = transport_status_text(&self.snapshot);
-        let viewport = window.viewport_size();
-        let compact = viewport.height < px(640.);
-        let status_padding = if compact { 12. } else { 16. };
-        // Keep the composer inset (8px top + 12px bottom) and the three left
-        // cards on one shared 147px track at the normal desktop size. The
-        // shared track is what makes the attempt card line up with the input
-        // surface instead of relying on content-driven flex sizing.
-        let composer_panel_height = if compact { 153. } else { 167. };
-        // The composer is inset 8px from the top of its reserved panel. Reserve
-        // exactly the same height for the attempt card so both top and bottom
-        // borders line up across the two columns.
-        let attempt_panel_height = composer_panel_height - 20.;
-        let side_by_side = viewport.width >= px(780.);
-        let has_conversation_task = self.snapshot.attempt_count > 0
-            || self.snapshot.active_thread_id.is_some()
-            || self.snapshot.phase != QueuePhase::Idle;
-        let assistant_is_error = matches!(
-            self.snapshot.phase,
-            QueuePhase::Backoff | QueuePhase::FatalError
-        ) || (matches!(
-            self.snapshot.phase,
-            QueuePhase::Waiting | QueuePhase::Paused
-        ) && is_retry_status(&self.snapshot.status_message));
-        let view_entity = cx.entity();
-        let start_handler = view_entity.clone();
-        let settings_handler = view_entity.clone();
-        let status_icon_element = if self.snapshot.phase == QueuePhase::Success {
-            let celebration_handler = view_entity.clone();
-            let celebration_id = self.celebration_burst_id;
-            div()
-                .id("success-status-icon")
-                .relative()
-                .w(px(58.))
-                .h(px(58.))
-                .flex_none()
-                .cursor_pointer()
-                .hover(|this| this.opacity(0.82))
-                .on_click(move |_, _, app| {
-                    celebration_handler.update(app, |view, cx| {
-                        view.trigger_success_burst(cx);
-                    });
-                })
-                .when(celebration_id > 0, |this| {
-                    this.child(success_feedback_overlay(celebration_id))
-                })
-                .child(status_icon(&self.snapshot, phase_accent, palette))
-                .into_any_element()
-        } else {
-            div()
-                .child(status_icon(&self.snapshot, phase_accent, palette))
-                .into_any_element()
-        };
-        let primary_is_stop = matches!(
-            self.snapshot.phase,
-            QueuePhase::Connecting
-                | QueuePhase::Sending
-                | QueuePhase::Waiting
-                | QueuePhase::Backoff
-        );
-        let primary_button = div()
-            .id(primary_label)
-            .focusable()
-            .w(px(34.))
-            .h(px(34.))
-            .flex_none()
-            .rounded_full()
-            .bg(rgb(palette.action))
+        let palette = Palette::for_window(window);
+        let now = Utc::now();
+        // Card border and header padding come off the space beside the sidebar.
+        self.header_space = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - 4. - 2. - 32.;
+        let card = self.render_content_card(palette, now, window, cx);
+        let content = div()
+            .id("longwatch-root")
+            .size_full()
+            .relative()
             .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .hover(|this| this.opacity(0.84))
-            .child(
-                Icon::new(if primary_is_stop {
-                    IconName::Stop
-                } else {
-                    IconName::ArrowUp
-                })
-                .size(px(if primary_is_stop { 24. } else { 18. }))
-                .color(rgb(palette.action_text)),
-            )
-            .on_click(move |_, window, app| {
-                let prompt = start_handler
-                    .read(app)
-                    .prompt_input
-                    .read(app)
-                    .value()
-                    .to_string();
-                let cwd = start_handler
-                    .read(app)
-                    .cwd_input
-                    .read(app)
-                    .value()
-                    .to_string();
-                let phrases = start_handler
-                    .read(app)
-                    .phrases_input
-                    .read(app)
-                    .value()
-                    .to_string();
-                start_handler.update(app, |view, cx| {
-                    if matches!(
-                        view.snapshot.phase,
-                        QueuePhase::Connecting
-                            | QueuePhase::Sending
-                            | QueuePhase::Waiting
-                            | QueuePhase::Backoff
-                    ) {
-                        view.stop_now(window, cx);
-                    } else if view.snapshot.phase == QueuePhase::Paused
-                        && view.snapshot.active_thread_id.is_some()
-                    {
-                        view.resume_now(cx);
-                    } else {
-                        view.start_now(prompt, cwd, phrases, cx);
-                    }
-                    cx.notify();
-                });
-            });
-        let settings_button = div()
-            .id("advanced-settings")
-            .focusable()
-            .h(px(34.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(rgb(palette.border))
-            .bg(rgb(palette.surface_subtle))
-            .text_sm()
-            .text_color(rgb(palette.text_secondary))
-            .cursor_pointer()
-            .hover({
-                let hover = palette.hover;
-                move |this| this.bg(rgb(hover))
+            .flex_col()
+            .bg(rgb(palette.shell))
+            .text_color(rgb(palette.text))
+            .when(cfg!(target_os = "windows"), |this| {
+                this.child(self.render_titlebar(palette, window))
             })
             .child(
-                Icon::new(IconName::Setting)
-                    .size(px(16.))
-                    .color(rgb(palette.text_secondary)),
-            )
-            .child("设置")
-            .on_click(move |_, window, app| {
-                settings_handler.update(app, |view, cx| {
-                    let _ = window;
-                    view.toggle_advanced_now(cx);
-                });
-            });
-
-        let full_screen_handler = view_entity.clone();
-        let audio_handler = view_entity.clone();
-        let full_screen_switch =
-            Switch::new(self.full_screen_toggle.clone()).on_change(move |change, _, app| {
-                full_screen_handler
-                    .update(app, |view, cx| view.set_full_screen(change.current, cx));
-            });
-        let audio_switch =
-            Switch::new(self.audio_toggle.clone()).on_change(move |change, _, app| {
-                audio_handler.update(app, |view, cx| view.set_audio_alert(change.current, cx));
-            });
-
-        let logs_handler = view_entity.clone();
-        let open_logs_button = settings_action_button(
-            "open-log-directory",
-            "打开日志",
-            IconName::FolderOpen,
-            rgb(palette.text_secondary),
-            palette,
-        )
-        .on_click(move |_, _, app| {
-            logs_handler.update(app, |view, _| view.open_logs_now());
-        });
-        let diagnostics_handler = view_entity.clone();
-        let copy_diagnostics_button = settings_action_button(
-            "copy-diagnostics",
-            if self.diagnostic_copy_feedback == CopyFeedback::Copied {
-                "已复制"
-            } else {
-                "复制诊断"
-            },
-            if self.diagnostic_copy_feedback == CopyFeedback::Copied {
-                IconName::Check
-            } else {
-                IconName::Copy
-            },
-            if self.diagnostic_copy_feedback == CopyFeedback::Copied {
-                rgb(palette.brand)
-            } else {
-                rgb(palette.text_secondary)
-            },
-            palette,
-        )
-        .on_click(move |_, window, app| {
-            diagnostics_handler.update(app, |view, cx| {
-                view.copy_diagnostics(window, cx);
-            });
-        });
-        let diagnostic_actions = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(copy_diagnostics_button)
-            .child(open_logs_button);
-
-        let conversation_history = if has_conversation_task {
-            let mut history = self.snapshot.conversation.clone();
-            // State files written by older versions only had one preview. Keep
-            // that result visible while the new local history is being built.
-            if history.is_empty() {
-                history.push(ConversationMessage {
-                    role: ConversationRole::User,
-                    content: self.config.prompt.clone(),
-                    automatic: false,
-                });
-                if !self.snapshot.reply_preview.trim().is_empty()
-                    || self.snapshot.phase != QueuePhase::Success
-                {
-                    history.push(ConversationMessage {
-                        role: ConversationRole::Assistant,
-                        content: conversation_text(&self.snapshot),
-                        automatic: true,
-                    });
-                }
-            }
-            let transient_assistant = conversation_text(&self.snapshot);
-            let last_is_same_reply = history.last().is_some_and(|message| {
-                message.role == ConversationRole::Assistant
-                    && message.content == transient_assistant
-            });
-            if !last_is_same_reply
-                && (!transient_assistant.trim().is_empty())
-                && matches!(
-                    self.snapshot.phase,
-                    QueuePhase::Connecting
-                        | QueuePhase::Sending
-                        | QueuePhase::Waiting
-                        | QueuePhase::Backoff
-                        | QueuePhase::Paused
-                        | QueuePhase::FatalError
-                )
-            {
-                history.push(ConversationMessage {
-                    role: ConversationRole::Assistant,
-                    content: transient_assistant,
-                    automatic: true,
-                });
-            }
-            let history_len = history.len();
-            let history_elements = history
-                .iter()
-                .enumerate()
-                .map(|(index, message)| match message.role {
-                    ConversationRole::User => div()
-                        .w_full()
-                        .min_w(px(0.))
-                        .flex_none()
-                        .flex()
-                        .justify_end()
-                        .child(
-                            div()
-                                .flex_none()
-                                .max_w(px(600.))
-                                .min_w(px(72.))
-                                .px_3()
-                                .py_2()
-                                .rounded(px(18.))
-                                .bg(rgb(palette.user_bubble))
-                                .text_base()
-                                .text_color(rgb(palette.user_text))
-                                .whitespace_normal()
-                                .child(message.content.clone()),
-                        )
-                        .into_any_element(),
-                    ConversationRole::Assistant | ConversationRole::System => {
-                        let markdown = chat_markdown_source(&message.content);
-                        let text_color = if assistant_is_error
-                            && message.automatic
-                            && index + 1 == history_len
-                        {
-                            rgb(palette.error)
-                        } else if message.role == ConversationRole::System {
-                            rgb(palette.text_secondary)
-                        } else {
-                            rgb(palette.text)
-                        };
-                        div()
-                            .w_full()
-                            .min_w(px(0.))
-                            .flex_none()
-                            .flex()
-                            .justify_start()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w(px(0.))
-                                    .flex_none()
-                                    .max_w(px(640.))
-                                    .text_base()
-                                    .text_color(text_color)
-                                    .child(
-                                        TextView::markdown(
-                                            (
-                                                gpui::ElementId::from((
-                                                    "assistant-markdown",
-                                                    index,
-                                                )),
-                                                if palette.dark { "dark" } else { "light" },
-                                            ),
-                                            markdown,
-                                            window,
-                                            cx,
-                                        )
-                                        .style(
-                                            chat_text_view_style(palette)
-                                                .paragraph_gap(gpui::rems(0.45))
-                                                .heading_font_size(|level, base| match level {
-                                                    1..=2 => base * 1.15,
-                                                    3 => base * 1.05,
-                                                    _ => base * 0.95,
-                                                })
-                                                .code_block(
-                                                    StyleRefinement::default().mt(gpui::rems(0.55)),
-                                                ),
-                                        ),
-                                    ),
-                            )
-                            .into_any_element()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let assistant_text = conversation_text(&self.snapshot);
-            let copy_text = assistant_text.clone();
-            let copy_handler = view_entity.clone();
-            let copy_button = icon_action_button(
-                "复制回复",
-                if self.copy_feedback == CopyFeedback::Copied {
-                    IconName::Check
-                } else {
-                    IconName::Copy
-                },
-                if self.copy_feedback == CopyFeedback::Copied {
-                    rgb(palette.brand)
-                } else {
-                    rgb(palette.text_secondary)
-                },
-                palette,
-            )
-            .on_click(move |_, window, app| {
-                let text = copy_text.clone();
-                copy_handler.update(app, |view, cx| view.copy_reply(text, window, cx));
-            });
-            let can_open_result = self.snapshot.phase == QueuePhase::Success
-                && self.snapshot.active_thread_id.is_some();
-            let open_result_handler = view_entity.clone();
-            let open_result_button = icon_action_button(
-                "打开结果",
-                IconName::Fullscreen,
-                rgb(palette.text_secondary),
-                palette,
-            )
-            .on_click(move |_, window, app| {
-                open_result_handler.update(app, |view, _| {
-                    let _ = window;
-                    view.open_thread_now();
-                });
-            });
-            let assistant_actions = div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(copy_button)
-                .when(can_open_result, |this| this.child(open_result_button))
-                .when_some(
-                    self.snapshot.reply_completed_at.map(reply_time_label),
-                    |this, time| {
-                        this.child(
-                            div()
-                                .ml_1()
-                                .text_xs()
-                                .text_color(rgb(palette.text_muted))
-                                .child(time),
-                        )
-                    },
-                );
-            let assistant_content = div()
-                .w_full()
-                .min_w(px(0.))
-                .flex()
-                .flex_col()
-                .gap_4()
-                .children(history_elements)
-                .child(assistant_actions);
-            div()
-                .w_full()
-                .min_w(px(0.))
-                .flex()
-                .flex_col()
-                .gap_4()
-                .child(assistant_content)
-                .into_any_element()
-        } else {
-            div()
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .px_3()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(palette.text_muted))
-                        .child("等待任务"),
-                )
-                .into_any_element()
-        };
-
-        let conversation_card = div()
-            .h_full()
-            .flex_1()
-            .min_h(px(0.))
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .rounded(px(PANEL_RADIUS))
-            .border_1()
-            .border_color(rgb(palette.border))
-            .bg(rgb(palette.surface))
-            .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_4()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(rgb(palette.divider))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(palette.text))
-                            .child("Codex 对话"),
-                    )
-                    .child(
-                        Tag::new(reply_tag_label(self.snapshot.phase))
-                            .theme(tag_theme(self.snapshot.phase)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("conversation-history")
-                    .flex_1()
-                    .min_h(px(64.))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.conversation_scroll)
-                    .px_4()
-                    .py_3()
-                    .bg(rgb(palette.surface))
-                    .child(conversation_history),
-            )
-            .child(
-                div()
-                    .h(px(composer_panel_height))
-                    .flex_none()
-                    .px_3()
-                    .pt_2()
-                    .pb_3()
-                    .child(
-                        div()
-                            .size_full()
-                            .relative()
-                            .overflow_hidden()
-                            .rounded(px(INNER_RADIUS))
-                            .border_1()
-                            .border_color(rgb(palette.border))
-                            .bg(rgb(palette.surface))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .right_0()
-                                    .bottom_0()
-                                    .child(composer_field(self.prompt_input.clone(), palette)),
-                            )
-                            .child(
-                                div()
-                                    // Keep the editor full-height and place the controls over
-                                    // its lower edge. The stock Textarea border now lands at the
-                                    // composer's outer edge instead of between text and controls.
-                                    .absolute()
-                                    .left_0()
-                                    .right_0()
-                                    .bottom_0()
-                                    .h(px(40.))
-                                    .bg(rgb(palette.surface))
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .px_2()
-                                    .pb_2()
-                                    .when(self.prompt_error, |this| {
-                                        this.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(rgb(palette.error))
-                                                .child("请输入任务内容后再开始"),
-                                        )
-                                    })
-                                    .when(self.snapshot.queued_message.is_some(), |this| {
-                                        this.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(palette.brand))
-                                                .child("已排队 1 条，当前任务结束后自动发送"),
-                                        )
-                                    })
-                                    .child(div().flex_1())
-                                    .child(primary_button),
-                            ),
-                    ),
-            )
-            .into_any_element();
-
-        let status_card = div()
-            .when(side_by_side, |this| this.flex_1().min_h(px(0.)))
-            .when(!side_by_side, |this| this.flex_none())
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .rounded(px(PANEL_RADIUS))
-            .border_1()
-            .border_color(rgb(palette.border))
-            .bg(rgb(palette.surface))
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_4()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(rgb(palette.divider))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(palette.text))
-                            .child("状态"),
-                    )
-                    .child(Tag::new(phase).theme(tag_theme(self.snapshot.phase))),
-            )
-            .child(
-                div()
-                    .when(side_by_side, |this| this.flex_1().min_h(px(0.)))
-                    .when(!side_by_side, |this| this.flex_none())
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .child(
-                        div()
-                            .h(px(attempt_panel_height))
-                            .flex_none()
-                            .relative()
-                            .overflow_hidden()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .gap_2()
-                            .p(px(status_padding))
-                            .rounded(px(INNER_RADIUS))
-                            .bg(status_surface(self.snapshot.phase, palette))
-                            .border_1()
-                            .border_color(status_surface_border(self.snapshot.phase, palette))
-                            .when(self.snapshot.phase == QueuePhase::Success, |this| {
-                                this.child(success_completion_background())
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_3()
-                                    .when(self.snapshot.phase == QueuePhase::Success, |this| {
-                                        this.flex_col()
-                                    })
-                                    .child(status_icon_element)
-                                    .child(
-                                        div()
-                                            .text_size(
-                                                if self.snapshot.phase == QueuePhase::Success {
-                                                    px(22.)
-                                                } else {
-                                                    px(18.)
-                                                },
-                                            )
-                                            .font_weight(FontWeight::BOLD)
-                                            .child(simple_status_title(&self.snapshot)),
-                                    ),
-                            )
-                            .when(self.snapshot.phase != QueuePhase::Success, |this| {
-                                this.child(
-                                    div()
-                                        .w_full()
-                                        .px_2()
-                                        .text_sm()
-                                        .text_center()
-                                        .text_color(if has_runtime_warning {
-                                            rgb(palette.error)
-                                        } else {
-                                            rgb(palette.text_secondary)
-                                        })
-                                        .child(phase_detail),
-                                )
-                            }),
-                    )
-                    .when(side_by_side, |this| {
-                        this.child(
-                            div()
-                                .h(px(attempt_panel_height))
-                                .flex_none()
-                                .flex()
-                                .flex_col()
-                                .rounded(px(INNER_RADIUS))
-                                .border_1()
-                                .border_color(rgb(palette.border_soft))
-                                .bg(rgb(palette.surface_alt))
-                                .child(animated_attempt_route(
-                                    self.snapshot.attempt_count,
-                                    self.snapshot.consecutive_retries,
-                                    self.snapshot.phase,
-                                    phase_accent,
-                                    self.route_motion_frame,
-                                    palette,
-                                )),
-                        )
-                        .child(
-                            div()
-                                .h(px(attempt_panel_height))
-                                .flex_none()
-                                .flex()
-                                .flex_col()
-                                .rounded(px(INNER_RADIUS))
-                                .border_1()
-                                .border_color(rgb(palette.border_soft))
-                                .bg(rgb(palette.surface_alt))
-                                .child(attempt_grid(
-                                    self.snapshot.attempt_count,
-                                    phase_accent,
-                                    palette,
-                                )),
-                        )
-                    }),
-            );
-
-        let dashboard = if side_by_side {
-            div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .gap_3()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .h_full()
-                        .flex()
-                        .flex_col()
-                        .child(status_card),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .h_full()
-                        .flex()
-                        .flex_col()
-                        .child(conversation_card),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(status_card)
-                .child(conversation_card)
-                .into_any_element()
-        };
-
-        let advanced_view = if self.advanced_open {
-            let auto_send_handler = view_entity.clone();
-            let auto_send_switch =
-                Switch::new(self.auto_send_toggle.clone()).on_change(move |change, _, app| {
-                    auto_send_handler.update(app, |view, cx| {
-                        view.set_auto_send_default(change.current, cx)
-                    });
-                });
-            let close_handler = view_entity.clone();
-            let close_button = icon_action_button(
-                "close-settings",
-                IconName::Close,
-                rgb(palette.text_secondary),
-                palette,
-            )
-            .on_click(move |_, window, app| {
-                close_handler.update(app, |view, cx| {
-                    let _ = window;
-                    view.toggle_advanced_now(cx);
-                });
-            });
-            let default_prompt_field = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .child(label("启动默认消息", palette))
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .mr_2()
-                                .text_xs()
-                                .text_color(rgb(palette.text_muted))
-                                .child("启动后自动发送"),
-                        )
-                        .child(auto_send_switch),
-                )
-                .child(rounded_field(self.default_prompt_input.clone(), palette));
-            let secondary_fields = if viewport.width >= px(720.) {
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(label("工作目录（可选）", palette))
-                            .child(rounded_field(self.cwd_input.clone(), palette)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(label("繁忙提示短语（用 | 分隔）", palette))
-                            .child(rounded_field(self.phrases_input.clone(), palette)),
-                    )
-            } else {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(label("工作目录（可选）", palette))
-                    .child(rounded_field(self.cwd_input.clone(), palette))
-                    .child(label("繁忙提示短语（用 | 分隔）", palette))
-                    .child(rounded_field(self.phrases_input.clone(), palette))
-            };
-            let fields = div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .p_3()
-                .rounded(px(INNER_RADIUS))
-                .border_1()
-                .border_color(rgb(palette.border_soft))
-                .bg(rgb(palette.surface_alt))
-                .child(default_prompt_field)
-                .child(secondary_fields);
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .bg(rgba(palette.overlay))
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_3()
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(820.))
-                        .rounded(px(PANEL_RADIUS))
-                        .overflow_hidden()
-                        .border_1()
-                        .border_color(rgb(palette.border))
-                        .bg(rgb(palette.surface))
-                        .child(
-                            div()
-                                .h(px(64.))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .px_4()
-                                .border_b_1()
-                                .border_color(rgb(palette.border_soft))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .text_base()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(palette.text))
-                                                .child("设置"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(palette.text_muted))
-                                                .child("启动、提醒与运行诊断"),
-                                        ),
-                                )
-                                .child(close_button),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .p_3()
-                                .child(fields)
-                                .child(if viewport.width >= px(720.) {
-                                    div()
-                                        .flex()
-                                        .gap_2()
-                                        .child(setting_tile(
-                                            "全屏强提示",
-                                            "成功或错误时闪屏",
-                                            IconName::Brightness1,
-                                            full_screen_switch,
-                                            self.config.full_screen_flash_enabled,
-                                            None,
-                                            palette,
-                                        ))
-                                        .child(setting_tile(
-                                            "成功音效提示",
-                                            "完成后循环响铃",
-                                            IconName::SoundHighFilled,
-                                            audio_switch,
-                                            self.config.audio_alert_enabled,
-                                            None,
-                                            palette,
-                                        ))
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .child(setting_row(
-                                            "全屏强提示",
-                                            "成功或错误时闪屏",
-                                            IconName::Brightness1,
-                                            full_screen_switch,
-                                            self.config.full_screen_flash_enabled,
-                                            None,
-                                            palette,
-                                        ))
-                                        .child(setting_row(
-                                            "成功音效提示",
-                                            "完成后循环响铃",
-                                            IconName::SoundHighFilled,
-                                            audio_switch,
-                                            self.config.audio_alert_enabled,
-                                            None,
-                                            palette,
-                                        ))
-                                        .into_any_element()
-                                })
-                                .child(diagnostic_card(
-                                    &self.codex_cli.path_label(),
-                                    diagnostic_ok,
-                                    &cli_status,
-                                    &transport_status,
-                                    diagnostic_actions,
-                                    palette,
-                                )),
-                        ),
-                )
-        } else {
-            div()
-        };
-
-        let titlebar = titlebar(self.logo_image.clone(), palette);
-        let keyboard_handler = view_entity.clone();
-        let content = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(palette.canvas))
-            .when(cfg!(target_os = "windows"), |this| this.child(titlebar))
-            .child(
-                div()
-                    .id("longwatch-scroll")
                     .flex_1()
                     .min_h(px(0.))
-                    .overflow_hidden()
+                    .flex()
+                    .child(self.render_sidebar(palette, now, cx))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .h_full()
-                            .w_full()
-                            .px_5()
-                            .pt_3()
-                            .pb_3()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .pb_2()
-                                    .border_b_1()
-                                    .border_color(rgb(palette.border_soft))
-                                    .child(
-                                        div()
-                                            .text_xl()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(palette.text))
-                                            .child("STAY WITH THE TASK."),
-                                    )
-                                    .child(div().flex_1())
-                                    .child(
-                                        div()
-                                            .h(px(34.))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .px_3()
-                                            .rounded_lg()
-                                            .border_1()
-                                            .border_color(rgb(palette.border))
-                                            .bg(rgb(palette.surface))
-                                            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(
-                                                if diagnostic_ok {
-                                                    rgb(palette.brand)
-                                                } else {
-                                                    rgb(palette.error)
-                                                },
-                                            ))
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(palette.text_secondary))
-                                                    .child(cli_status),
-                                            )
-                                            .child(
-                                                div().w(px(1.)).h(px(14.)).bg(rgb(palette.divider)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(palette.text_muted))
-                                                    .child(format!(
-                                                        "v{}",
-                                                        env!("CARGO_PKG_VERSION")
-                                                    )),
-                                            ),
-                                    )
-                                    .child(settings_button),
-                            )
-                            .child(dashboard),
+                            .when(!cfg!(target_os = "windows"), |this| this.pt(px(4.)))
+                            .pr(px(4.))
+                            .pb(px(4.))
+                            .child(card),
                     ),
             )
-            .child(advanced_view)
-            .capture_key_down(move |event, window, app| {
-                let key = event.keystroke.key.as_str();
-                let is_enter = matches!(key, "enter" | "return");
-                let prompt_input = keyboard_handler.read(app).prompt_input.clone();
-                let prompt_focused = prompt_input.focus_handle(app).is_focused(window);
-                let prompt_composing = prompt_input.update(app, |state, cx| {
-                    <InputState as EntityInputHandler>::marked_text_range(state, window, cx)
-                        .is_some()
-                });
-                let advanced_open = keyboard_handler.read(app).advanced_open;
-                let plain_prompt_enter = is_enter
-                    && prompt_focused
-                    && !prompt_composing
-                    && !event.keystroke.modifiers.modified();
-                let shortcut_enter = is_enter
-                    && event.keystroke.modifiers.secondary()
-                    && !event.keystroke.modifiers.shift
-                    && !(prompt_focused && prompt_composing)
-                    && !advanced_open;
-                if plain_prompt_enter || shortcut_enter {
-                    let active = matches!(
-                        keyboard_handler.read(app).snapshot.phase,
-                        QueuePhase::Connecting
-                            | QueuePhase::Sending
-                            | QueuePhase::Waiting
-                            | QueuePhase::Backoff
-                    );
-                    let prompt = keyboard_handler
-                        .read(app)
-                        .prompt_input
-                        .read(app)
-                        .value()
-                        .to_string();
-                    let cwd = keyboard_handler
-                        .read(app)
-                        .cwd_input
-                        .read(app)
-                        .value()
-                        .to_string();
-                    let phrases = keyboard_handler
-                        .read(app)
-                        .phrases_input
-                        .read(app)
-                        .value()
-                        .to_string();
-                    keyboard_handler.update(app, |view, cx| {
-                        if active {
-                            view.queue_message_now(prompt, cwd, phrases, cx);
-                        } else {
-                            view.start_now(prompt, cwd, phrases, cx);
-                        }
-                        cx.notify();
-                    });
-                    app.stop_propagation();
-                } else if key == "escape" && keyboard_handler.read(app).advanced_open {
-                    keyboard_handler.update(app, |view, cx| {
-                        view.toggle_advanced_now(cx);
-                    });
-                    app.stop_propagation();
-                }
-            });
-
+            .when(self.exit_confirm_open, |this| {
+                this.child(self.render_exit_dialog(palette, cx))
+            })
+            .capture_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                view.handle_key(event, window, cx);
+            }));
         let config = TDesignConfig::new()
             .theme_mode(ThemeMode::System)
-            .theme_overrides(ThemeOverrides::new().brand(rgb(palette.brand)));
+            .theme_overrides(ThemeOverrides::new().brand(rgb(palette.primary)));
         TDesignRoot::with_config(config).child(content)
     }
 }
 
-fn titlebar(logo_image: Arc<Image>, palette: UiPalette) -> gpui::Div {
-    div()
-        .h(px(32.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .border_b_1()
-        .border_color(rgb(palette.divider))
-        .bg(rgb(palette.surface))
-        .child(
-            div()
-                .h_full()
-                .flex_1()
-                .px_3()
-                .flex()
-                .items_center()
-                .window_control_area(WindowControlArea::Drag)
-                .child(
-                    div()
-                        .w(px(18.))
-                        .h(px(18.))
-                        .rounded(px(4.))
-                        .overflow_hidden()
-                        .child(img(logo_image).size_full()),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(palette.text_secondary))
-                        .child("Longwatch"),
-                ),
+// ---------------------------------------------------------------------------
+// Shell: title bar and queue sidebar
+// ---------------------------------------------------------------------------
+
+impl QueueView {
+    fn render_titlebar(&self, palette: Palette, window: &Window) -> impl IntoElement {
+        let maximized = window.is_maximized();
+        div()
+            .h(px(TITLEBAR_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .h_full()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .pl(px(16.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(
+                        div()
+                            .size(px(16.))
+                            .rounded(px(4.))
+                            .overflow_hidden()
+                            .child(img(self.logo.clone()).size_full()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(palette.text_secondary))
+                            .child("Longwatch"),
+                    ),
+            )
+            .child(window_control(WindowControlArea::Min, palette, false))
+            .child(window_control(WindowControlArea::Max, palette, maximized))
+            .child(window_control(WindowControlArea::Close, palette, false))
+    }
+
+    fn render_sidebar(
+        &self,
+        palette: Palette,
+        now: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let lists = QueueLists::from_snapshot(&self.snapshot);
+        let new_selected = self.page == Page::Queue && self.selection == Selection::New;
+        let new_task = div()
+            .id("new-task")
+            .h(px(34.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(10.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(rgb(if new_selected {
+                palette.primary_border
+            } else {
+                palette.border_tertiary
+            }))
+            .bg(rgb(if new_selected {
+                palette.primary_bg
+            } else {
+                palette.base
+            }))
+            .shadow(palette.soft_shadow())
+            .cursor_pointer()
+            .hover(move |this| this.border_color(rgb(palette.border_secondary)))
+            .child(
+                Icon::new(IconName::Add)
+                    .size(px(15.))
+                    .color(rgb(if new_selected {
+                        palette.primary_text
+                    } else {
+                        palette.text
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(if new_selected {
+                        palette.primary_text
+                    } else {
+                        palette.text
+                    }))
+                    .child("新任务"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(palette.text_quaternary))
+                    .child("Ctrl N"),
+            )
+            .on_click(cx.listener(|view, _, window, cx| view.start_new_task(window, cx)));
+
+        let mut list = div().flex().flex_col().gap(px(2.)).pb(px(8.));
+        if lists.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(10.))
+                    .pt(px(18.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(palette.text_tertiary))
+                            .child("队列是空的"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(rgb(palette.text_quaternary))
+                            .child("输入任务后按 Enter，Longwatch 会一直排队到 Codex 完成。"),
+                    ),
+            );
+        }
+        if !lists.running.is_empty() {
+            list = list.child(section_heading(
+                "进行中",
+                Some(format!(
+                    "{}/{}",
+                    self.snapshot.running_session_count, self.config.max_concurrent_sessions
+                )),
+                None,
+                palette,
+            ));
+            for session in &lists.running {
+                list = list.child(self.session_row(session, palette, now, cx));
+            }
+        }
+        if !lists.waiting.is_empty() {
+            list = list.child(section_heading(
+                "排队中",
+                Some(lists.waiting.len().to_string()),
+                None,
+                palette,
+            ));
+            for (position, task) in &lists.waiting {
+                list = list.child(self.pending_row(*position, task, palette, cx));
+            }
+        }
+        if !lists.paused.is_empty() {
+            list = list.child(section_heading("已暂停", None, None, palette));
+            for session in &lists.paused {
+                list = list.child(self.session_row(session, palette, now, cx));
+            }
+        }
+        if !lists.finished.is_empty() {
+            let clear = text_button("clear-finished", None, "清除", ButtonStyle::Ghost, palette)
+                .h(px(20.))
+                .px(px(6.))
+                .text_size(px(11.))
+                .on_click(cx.listener(|view, _, window, cx| view.clear_finished(window, cx)));
+            list = list.child(section_heading(
+                "已完成",
+                None,
+                Some(clear.into_any_element()),
+                palette,
+            ));
+            for session in &lists.finished {
+                list = list.child(self.session_row(session, palette, now, cx));
+            }
+        }
+
+        let settings_selected = self.page == Page::Settings;
+        let cli_tone = match &self.codex_cli {
+            None => palette.text_quaternary,
+            Some(cli) if cli.available() => palette.success,
+            Some(_) => palette.error,
+        };
+        let footer = div()
+            .flex_none()
+            .pt(px(6.))
+            .border_t_1()
+            .border_color(rgb(palette.border_tertiary))
+            .child(
+                div()
+                    .id("open-settings")
+                    .h(px(30.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .when(settings_selected, |this| this.bg(rgba(palette.active)))
+                    .when(!settings_selected, |this| {
+                        this.hover(move |style| style.bg(rgba(palette.hover)))
+                    })
+                    .child(
+                        Icon::new(IconName::Setting)
+                            .size(px(15.))
+                            .color(rgb(palette.text_tertiary)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.))
+                            .text_color(rgb(if settings_selected {
+                                palette.text
+                            } else {
+                                palette.text_secondary
+                            }))
+                            .child("设置"),
+                    )
+                    .child(div().size(px(6.)).rounded_full().bg(rgb(cli_tone)))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(palette.text_quaternary))
+                            .child(
+                                self.codex_cli
+                                    .as_ref()
+                                    .map_or_else(|| "检测中".to_owned(), cli_short_label),
+                            ),
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| view.open_settings(cx))),
+            );
+
+        div()
+            .w(px(SIDEBAR_WIDTH))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .px(px(8.))
+            .pb(px(8.))
+            .when(!cfg!(target_os = "windows"), |this| this.pt(px(8.)))
+            .child(new_task)
+            .child(
+                div()
+                    .id("queue-list")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .mt(px(6.))
+                    .overflow_y_scroll()
+                    .child(list),
+            )
+            .child(footer)
+    }
+
+    fn session_row(
+        &self,
+        session: &QueueSessionSummary,
+        palette: Palette,
+        now: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = session.id;
+        let selected = self.page == Page::Queue && self.selection == Selection::Session(id);
+        let meta_color = match session.phase {
+            QueuePhase::FatalError => palette.error,
+            _ => palette.text_tertiary,
+        };
+        task_row(
+            ElementId::Name(format!("session-row-{id}").into()),
+            selected,
+            session_indicator(session, palette),
+            session.title.clone(),
+            session_meta(session, now),
+            meta_color,
+            palette,
         )
-        .child(titlebar_control(
-            "−",
-            WindowControlArea::Min,
-            false,
+        .on_click(cx.listener(move |view, _, window, cx| {
+            view.select(Selection::Session(id), window, cx);
+        }))
+    }
+
+    fn pending_row(
+        &self,
+        position: usize,
+        task: &PendingTaskSummary,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = task.id;
+        let selected = self.page == Page::Queue && self.selection == Selection::Pending(id);
+        let meta = if task.target_session_id.is_some() {
+            format!("第 {position} 位 · 追加到原会话")
+        } else {
+            format!("第 {position} 位 · 等待空闲通道")
+        };
+        task_row(
+            ElementId::Name(format!("pending-row-{id}").into()),
+            selected,
+            queued_ring(palette),
+            task.title.clone(),
+            meta,
+            palette.text_tertiary,
             palette,
-        ))
-        .child(titlebar_control(
-            "×",
-            WindowControlArea::Close,
-            true,
-            palette,
-        ))
+        )
+        .on_click(cx.listener(move |view, _, window, cx| {
+            view.select(Selection::Pending(id), window, cx);
+        }))
+    }
 }
 
-fn titlebar_control(
-    symbol: &'static str,
-    area: WindowControlArea,
-    close: bool,
-    palette: UiPalette,
-) -> gpui::Div {
+// ---------------------------------------------------------------------------
+// Content card: new task, task detail, waiting task, settings
+// ---------------------------------------------------------------------------
+
+impl QueueView {
+    fn render_content_card(
+        &mut self,
+        palette: Palette,
+        now: DateTime<Utc>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = match self.page {
+            Page::Settings => self.render_settings(palette, cx),
+            Page::Queue => match self.selection {
+                Selection::New => self.render_new_task(palette, window, cx),
+                Selection::Session(id) => self.render_session(id, palette, now, window, cx),
+                Selection::Pending(id) => self.render_pending(id, palette, cx),
+            },
+        };
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(CONTENT_RADIUS))
+            .border_1()
+            .border_color(rgb(palette.border_tertiary))
+            .bg(rgb(palette.surface))
+            .when(self.runtime_stopped, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .px(px(16.))
+                        .py(px(8.))
+                        .bg(rgb(palette.error_bg))
+                        .text_size(px(12.))
+                        .text_color(rgb(palette.error))
+                        .child("后台任务意外停止，请重新启动 Longwatch。详细原因已写入日志目录。"),
+                )
+            })
+            .child(div().flex_1().min_h(px(0.)).flex().flex_col().child(body))
+            .when_some(self.notice.clone(), |this, notice| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom(px(16.))
+                        .right(px(16.))
+                        .max_w(px(420.))
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(rgb(if notice.error {
+                            palette.error
+                        } else {
+                            palette.border_tertiary
+                        }))
+                        .bg(rgb(if notice.error {
+                            palette.error_bg
+                        } else {
+                            palette.surface
+                        }))
+                        .shadow(palette.overlay_shadow())
+                        .text_size(px(12.))
+                        .line_height(px(18.))
+                        .text_color(rgb(if notice.error {
+                            palette.error
+                        } else {
+                            palette.text
+                        }))
+                        .child(notice.text),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_new_task(
+        &mut self,
+        palette: Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let running = self.snapshot.running_session_count;
+        let max = usize::from(self.config.max_concurrent_sessions);
+        let waiting = self.snapshot.pending_tasks.len();
+        let capacity = if running < max && waiting == 0 {
+            if running == 0 {
+                "通道空闲，新任务会立即开始".to_owned()
+            } else {
+                format!("{running}/{max} 个通道在运行，新任务会立即开始")
+            }
+        } else {
+            format!(
+                "{running}/{max} 个通道在运行，新任务将排在第 {} 位",
+                waiting + 1
+            )
+        };
+        div()
+            .id("new-task-page")
+            .size_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .px(px(32.))
+            .py(px(32.))
+            .child(
+                div()
+                    .w(px(self.chat_width()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(20.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .size(px(36.))
+                                    .rounded(px(9.))
+                                    .overflow_hidden()
+                                    .child(img(self.logo.clone()).size_full()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(20.))
+                                    .line_height(px(32.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(palette.text))
+                                    .child("今天要让 Codex 完成什么？"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .line_height(px(20.))
+                                    .text_color(rgb(palette.text_tertiary))
+                                    .child("交给 Longwatch 后，它会一直排队：遇到高峰自动重试，直到拿到结果。"),
+                            ),
+                    )
+                    .child(self.render_composer(ComposerTarget::NewTask, true, palette, window, cx))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(12.))
+                            .text_color(rgb(palette.text_tertiary))
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(
+                                if running < max {
+                                    palette.success
+                                } else {
+                                    palette.warning
+                                },
+                            )))
+                            .child(capacity),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_session(
+        &mut self,
+        id: u64,
+        palette: Palette,
+        now: DateTime<Utc>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(summary) = self.summary(id).cloned() else {
+            return empty_state("这个任务已经移除", palette);
+        };
+        let header = self.render_session_header(&summary, palette, cx);
+        let Some(detail) = self.detail(id).cloned() else {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(empty_state("正在载入任务…", palette))
+                .into_any_element();
+        };
+
+        let mut column = div()
+            .w(px(self.chat_width()))
+            .flex()
+            .flex_col()
+            .gap(px(18.));
+        let entries = timeline_entries(&detail);
+        let entry_count = entries.len();
+        for (index, message) in entries.into_iter().enumerate() {
+            column = column.child(render_message(id, index, &message, palette, window, cx));
+        }
+        if let Some(card) = self.render_status_card(&summary, &detail, palette, now, cx) {
+            column = column.child(card);
+        } else if let Some(reply) = final_reply(&detail) {
+            column = column.child(self.render_reply_actions(&summary, &detail, reply, palette, cx));
+        }
+        if entry_count == 0 && self.render_status_placeholder(&detail) {
+            column = column.child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(rgb(palette.text_tertiary))
+                    .child("等待任务开始…"),
+            );
+        }
+
+        let target = self.composer_target();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .id(ElementId::Name(format!("timeline-{id}").into()))
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.timeline_scroll)
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .px(px(28.))
+                            .pt(px(22.))
+                            .pb(px(16.))
+                            .child(column),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(28.))
+                    .pb(px(16.))
+                    .child(self.render_staged_message(id, &detail, palette, cx))
+                    .child(
+                        div()
+                            .w(px(self.chat_width()))
+                            .child(self.render_composer(target, false, palette, window, cx)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_status_placeholder(&self, detail: &QueueSnapshot) -> bool {
+        detail.phase == QueuePhase::Idle && detail.attempt_count == 0
+    }
+
+    fn render_session_header(
+        &self,
+        summary: &QueueSessionSummary,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut actions = div().flex_none().flex().items_center().gap(px(4.));
+        if summary.active {
+            actions = actions
+                .child(
+                    text_button(
+                        "pause-task",
+                        Some(IconName::Pause),
+                        "暂停",
+                        ButtonStyle::Ghost,
+                        palette,
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.run_selected(RuntimeCommand::Pause, cx);
+                    })),
+                )
+                .child(
+                    text_button(
+                        "stop-task",
+                        Some(IconName::Stop),
+                        "停止",
+                        ButtonStyle::Ghost,
+                        palette,
+                    )
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.run_selected(RuntimeCommand::Stop, cx);
+                    })),
+                );
+        } else {
+            match summary.phase {
+                QueuePhase::Paused => {
+                    actions = actions
+                        .child(
+                            text_button(
+                                "resume-task",
+                                Some(IconName::Play),
+                                "继续",
+                                ButtonStyle::Primary,
+                                palette,
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.run_selected(RuntimeCommand::Resume, cx);
+                            })),
+                        )
+                        .child(
+                            text_button(
+                                "end-task",
+                                Some(IconName::Stop),
+                                "停止",
+                                ButtonStyle::Ghost,
+                                palette,
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.run_selected(RuntimeCommand::Stop, cx);
+                            })),
+                        );
+                }
+                QueuePhase::FatalError => {
+                    actions = actions.child(
+                        text_button(
+                            "retry-task",
+                            Some(IconName::Refresh),
+                            "重试",
+                            ButtonStyle::Primary,
+                            palette,
+                        )
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.run_selected(RuntimeCommand::Resume, cx);
+                        })),
+                    );
+                }
+                _ => {}
+            }
+            if summary.active_thread_id.is_some() {
+                actions = actions.child(
+                    text_button(
+                        "open-in-codex",
+                        Some(IconName::Jump),
+                        "在 Codex 中打开",
+                        ButtonStyle::Ghost,
+                        palette,
+                    )
+                    .on_click(cx.listener(|view, _, window, cx| view.open_thread(window, cx))),
+                );
+            }
+            actions = actions.child(
+                text_button(
+                    "remove-task",
+                    Some(IconName::Delete),
+                    "移除",
+                    ButtonStyle::DangerGhost,
+                    palette,
+                )
+                .on_click(cx.listener(|view, _, window, cx| view.dismiss_selected(window, cx))),
+            );
+        }
+        content_header(
+            summary.title.clone(),
+            self.header_space - 470.,
+            Some(status_pill(
+                session_state_label(summary),
+                session_tone(summary, palette),
+                palette,
+            )),
+            actions.into_any_element(),
+            palette,
+        )
+    }
+
+    fn render_status_card(
+        &self,
+        summary: &QueueSessionSummary,
+        detail: &QueueSnapshot,
+        palette: Palette,
+        now: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        // While waiting to retry, whatever the preview holds (an error or a
+        // "high demand" reply) is the reason for the wait.
+        let notice = (detail.reply_preview_is_notice
+            || !summary.active
+            || detail.phase == QueuePhase::Backoff)
+            .then(|| detail.reply_preview.trim())
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned);
+        let attempts = detail.attempt_count.max(summary.attempt_count);
+        let mut facts = Vec::new();
+        if detail.phase == QueuePhase::Backoff {
+            if attempts > 0 {
+                facts.push(format!("已尝试 {attempts} 次"));
+            }
+        } else if attempts > 1 {
+            facts.push(format!("第 {attempts} 次尝试"));
+        }
+        if let Some(waited) = detail
+            .first_attempt_at
+            .and_then(|since| elapsed_label(since, now))
+        {
+            facts.push(format!("已排队 {waited}"));
+        }
+        let (tone, headline, detail_text, action): (
+            u32,
+            String,
+            Option<String>,
+            Option<AnyElement>,
+        ) = match detail.phase {
+            QueuePhase::Backoff => {
+                let eta = detail
+                    .next_attempt_at
+                    .map_or_else(|| "稍后".to_owned(), |next| compact_eta(next, now));
+                (
+                    palette.warning,
+                    format!("Codex 暂时繁忙，{eta}重新排队"),
+                    notice.clone(),
+                    Some(
+                        text_button(
+                            "retry-now",
+                            Some(IconName::Refresh),
+                            "立即重试",
+                            ButtonStyle::Outline,
+                            palette,
+                        )
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.run_selected(RuntimeCommand::RetryNow, cx);
+                        }))
+                        .into_any_element(),
+                    ),
+                )
+            }
+            QueuePhase::Connecting => {
+                let reconnecting =
+                    detail.next_attempt_at.is_some() && is_retry_status(&detail.status_message);
+                let headline = match detail.next_attempt_at {
+                    Some(next) if reconnecting => {
+                        format!("连接中断，{}重新连接", compact_eta(next, now))
+                    }
+                    _ => "正在连接 Codex…".to_owned(),
+                };
+                (
+                    if reconnecting {
+                        palette.warning
+                    } else {
+                        palette.primary
+                    },
+                    headline,
+                    reconnecting.then(|| detail.status_message.clone()),
+                    None,
+                )
+            }
+            QueuePhase::Sending => (palette.primary, "正在发送任务…".to_owned(), None, None),
+            QueuePhase::Waiting => {
+                if is_retry_status(&detail.status_message) {
+                    (
+                        palette.warning,
+                        "Codex 正在自动重试".to_owned(),
+                        Some(strip_status_prefix(&detail.status_message)),
+                        None,
+                    )
+                } else if detail.reply_preview.trim().is_empty() {
+                    (palette.primary, "Codex 正在处理…".to_owned(), None, None)
+                } else {
+                    // Streaming text is already on screen; keep a quiet
+                    // progress line under it.
+                    (palette.primary, "Codex 正在输出…".to_owned(), None, None)
+                }
+            }
+            QueuePhase::Paused => (
+                palette.text_tertiary,
+                "已暂停".to_owned(),
+                Some(detail.status_message.clone()).filter(|text| !text.trim().is_empty()),
+                None,
+            ),
+            QueuePhase::FatalError => (
+                palette.error,
+                "需要处理".to_owned(),
+                Some(detail.status_message.clone()),
+                None,
+            ),
+            QueuePhase::Success | QueuePhase::Idle => return None,
+        };
+        let warning = detail.runtime_warning.clone();
+        Some(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .px(px(14.))
+                .py(px(12.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(rgb(palette.border_tertiary))
+                .bg(rgb(palette.elevated))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().size(px(7.)).flex_none().rounded_full().bg(rgb(tone)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_size(px(13.))
+                                .line_height(px(20.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(palette.text))
+                                .child(headline),
+                        )
+                        .when_some(action, |this, action| this.child(action)),
+                )
+                .when(!facts.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .pl(px(15.))
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(rgb(palette.text_tertiary))
+                            .child(facts.join(" · ")),
+                    )
+                })
+                .when_some(detail_text, |this, text| {
+                    this.child(
+                        div()
+                            .pl(px(15.))
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(rgb(palette.text_secondary))
+                            .line_clamp(4)
+                            .child(text),
+                    )
+                })
+                .when_some(warning, |this, warning| {
+                    this.child(
+                        div()
+                            .pl(px(15.))
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(rgb(palette.error))
+                            .child(warning),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn render_reply_actions(
+        &self,
+        summary: &QueueSessionSummary,
+        detail: &QueueSnapshot,
+        reply: String,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let copied = self.reply_copied;
+        let mut meta = Vec::new();
+        if let Some(completed) = detail.reply_completed_at {
+            meta.push(clock_label(completed));
+        }
+        if summary.phase == QueuePhase::Idle {
+            meta.push("已停止".to_owned());
+        }
+        if detail.attempt_count > 1 {
+            meta.push(format!("经过 {} 次尝试", detail.attempt_count));
+        }
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .child(
+                text_button(
+                    "copy-reply",
+                    Some(if copied {
+                        IconName::Check
+                    } else {
+                        IconName::Copy
+                    }),
+                    if copied { "已复制" } else { "复制" },
+                    ButtonStyle::Ghost,
+                    palette,
+                )
+                .h(px(24.))
+                .px(px(6.))
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    view.copy_reply(reply.clone(), window, cx);
+                })),
+            )
+            .when(!meta.is_empty(), |this| {
+                this.child(
+                    div()
+                        .pl(px(6.))
+                        .text_size(px(12.))
+                        .text_color(rgb(palette.text_quaternary))
+                        .child(meta.join(" · ")),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_staged_message(
+        &self,
+        session_id: u64,
+        detail: &QueueSnapshot,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (text, waiting_for_lane, pending_id) = if let Some(message) = &detail.queued_message {
+            (message.prompt.clone(), false, None)
+        } else if let Some(task) = self.pending_follow_up_for(session_id) {
+            (task.prompt.clone(), true, Some(task.id))
+        } else {
+            return div().into_any_element();
+        };
+        let label = if waiting_for_lane {
+            "追加消息正在等待空闲通道"
+        } else {
+            "当前回合结束后发送"
+        };
+        div()
+            .w(px(self.chat_width()))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(7.))
+            .rounded(px(10.))
+            .bg(rgb(palette.primary_bg))
+            .border_1()
+            .border_color(rgb(palette.primary_border))
+            .child(
+                Icon::new(IconName::Time)
+                    .size(px(13.))
+                    .color(rgb(palette.primary_text)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.))
+                    .text_color(rgb(palette.primary_text))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(12.))
+                    .text_color(rgb(palette.text_secondary))
+                    .child(ellipsize(&first_line(&text), 360., 12.)),
+            )
+            .child(
+                text_button(
+                    "withdraw-message",
+                    None,
+                    "撤回",
+                    ButtonStyle::Ghost,
+                    palette,
+                )
+                .h(px(22.))
+                .px(px(6.))
+                .on_click(cx.listener(
+                    move |view, _, window, cx| match pending_id {
+                        Some(pending_id) => view.cancel_pending(pending_id, window, cx),
+                        None => view.run_selected(RuntimeCommand::ClearQueuedMessage, cx),
+                    },
+                )),
+            )
+            .into_any_element()
+    }
+
+    fn render_pending(&self, id: u64, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some((index, task)) = self
+            .snapshot
+            .pending_tasks
+            .iter()
+            .enumerate()
+            .find(|(_, task)| task.id == id)
+        else {
+            return empty_state("任务已开始", palette);
+        };
+        let position = index + 1;
+        let running = self.snapshot.running_session_count;
+        let max = self.config.max_concurrent_sessions;
+        let header = content_header(
+            task.title.clone(),
+            self.header_space - 220.,
+            Some(status_pill("排队中", palette.text_tertiary, palette)),
+            text_button(
+                "cancel-pending",
+                Some(IconName::Close),
+                "取消排队",
+                ButtonStyle::DangerGhost,
+                palette,
+            )
+            .on_click(cx.listener(move |view, _, window, cx| view.cancel_pending(id, window, cx)))
+            .into_any_element(),
+            palette,
+        );
+        let headline = if position == 1 {
+            "排在第 1 位，有通道空闲时立即开始".to_owned()
+        } else {
+            format!("排在第 {position} 位，前面还有 {} 个任务", position - 1)
+        };
+        let mut facts = vec![format!("{running}/{max} 个通道正在运行")];
+        if let Some(directory) = &task.working_directory {
+            facts.push(format!("工作目录：{}", folder_name(directory)));
+        }
+        let column = div()
+            .w(px(self.chat_width()))
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .child(user_bubble(&task.prompt, palette))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .px(px(14.))
+                    .py(px(12.))
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(palette.border_tertiary))
+                    .bg(rgb(palette.elevated))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .w(px(14.))
+                                    .flex()
+                                    .justify_center()
+                                    .child(queued_ring(palette)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(palette.text))
+                                    .child(headline),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pl(px(22.))
+                            .text_size(px(12.))
+                            .text_color(rgb(palette.text_tertiary))
+                            .child(facts.join(" · ")),
+                    )
+                    .child(
+                        div().pl(px(22.)).pt(px(2.)).flex().child(
+                            text_button(
+                                "raise-concurrency",
+                                None,
+                                "调整同时运行的数量",
+                                ButtonStyle::Ghost,
+                                palette,
+                            )
+                            .h(px(22.))
+                            .px(px(6.))
+                            .text_color(rgb(palette.primary_text))
+                            .on_click(cx.listener(|view, _, _, cx| view.open_settings(cx))),
+                        ),
+                    ),
+            );
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .id(ElementId::Name(format!("pending-{id}").into()))
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .px(px(28.))
+                            .pt(px(22.))
+                            .pb(px(16.))
+                            .child(column),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_composer(
+        &self,
+        target: ComposerTarget,
+        large: bool,
+        palette: Palette,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let focused = self.prompt_input.focus_handle(cx).is_focused(window);
+        let blocked = matches!(target, ComposerTarget::Blocked(_));
+        let has_text = !self.prompt_input.read(cx).value().trim().is_empty();
+        let folder = match target {
+            ComposerTarget::NewTask => self.config.default_working_directory.clone(),
+            ComposerTarget::FollowUp { .. } => self.snapshot.session_working_directory.clone(),
+            ComposerTarget::Blocked(_) => None,
+        }
+        .filter(|path| !path.as_os_str().is_empty());
+        let folder_editable = target == ComposerTarget::NewTask;
+        let folder_label = folder
+            .as_deref()
+            .map_or_else(|| "默认目录".to_owned(), folder_name);
+        let mut folder_chip = div()
+            .id("folder-chip")
+            .h(px(28.))
+            .max_w(px(260.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .px(px(8.))
+            .rounded(px(8.))
+            .child(
+                Icon::new(IconName::FolderOpen)
+                    .size(px(14.))
+                    .color(rgb(palette.text_tertiary)),
+            )
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(12.))
+                    .text_color(rgb(if folder.is_some() {
+                        palette.text_secondary
+                    } else {
+                        palette.text_tertiary
+                    }))
+                    .child(ellipsize(&folder_label, 200., 12.)),
+            );
+        if folder_editable {
+            folder_chip = folder_chip
+                .cursor_pointer()
+                .hover(move |style| style.bg(rgb(palette.fill_secondary)))
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(px(12.))
+                        .color(rgb(palette.text_quaternary)),
+                )
+                .on_click(cx.listener(|view, _, window, cx| view.pick_folder(window, cx)));
+        }
+        let clear_folder = (folder_editable && folder.is_some()).then(|| {
+            div()
+                .id("clear-folder")
+                .size(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(rgb(palette.fill_secondary)))
+                .child(
+                    Icon::new(IconName::Close)
+                        .size(px(12.))
+                        .color(rgb(palette.text_tertiary)),
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.clear_folder(cx)))
+        });
+        let hint = if self.prompt_error {
+            Some(("请先输入任务内容", palette.error))
+        } else if large {
+            Some(("Enter 发送 · Shift+Enter 换行", palette.text_quaternary))
+        } else {
+            None
+        };
+        let can_send = !blocked && has_text;
+        let send_button = div()
+            .id("send-task")
+            .size(px(32.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(10.))
+            .bg(rgb(palette.primary))
+            .when(!can_send, |this| this.opacity(0.38))
+            .when(can_send, |this| {
+                this.cursor_pointer()
+                    .hover(move |style| style.bg(rgb(palette.primary_hover)))
+            })
+            .child(
+                Icon::new(IconName::ArrowUp)
+                    .size(px(16.))
+                    .color(rgb(palette.on_primary)),
+            )
+            .on_click(cx.listener(|view, _, window, cx| view.submit(window, cx)));
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .rounded(px(COMPOSER_RADIUS))
+            .border_1()
+            .border_color(rgb(if focused && !blocked {
+                palette.border_secondary
+            } else {
+                palette.border_tertiary
+            }))
+            .bg(rgb(if blocked {
+                palette.elevated
+            } else {
+                palette.base
+            }))
+            .shadow(palette.soft_shadow())
+            .child(
+                div()
+                    .h(px(if large { 120. } else { 76. }))
+                    .px(px(8.))
+                    .pt(px(6.))
+                    .text_size(px(14.))
+                    .child(
+                        Input::new(&self.prompt_input)
+                            .appearance(false)
+                            .bordered(false)
+                            .focus_bordered(false)
+                            .disabled(blocked)
+                            .h_full(),
+                    ),
+            )
+            .child(
+                div()
+                    .min_h(px(44.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .px(px(8.))
+                    .pt(px(6.))
+                    .pb(px(8.))
+                    .border_t_1()
+                    .border_dashed()
+                    .border_color(rgb(palette.border_tertiary))
+                    .child(folder_chip)
+                    .when_some(clear_folder, |this, button| this.child(button))
+                    .child(div().flex_1())
+                    .when_some(hint, |this, (hint, color)| {
+                        this.child(
+                            div()
+                                .mr(px(8.))
+                                .text_size(px(12.))
+                                .text_color(rgb(color))
+                                .child(hint),
+                        )
+                    })
+                    .child(send_button),
+            )
+            .into_any_element()
+    }
+
+    fn render_settings(&mut self, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let concurrency = div()
+            .h(px(30.))
+            .flex()
+            .items_center()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgb(palette.border_tertiary))
+            .bg(rgb(palette.base))
+            .child(
+                stepper_button(
+                    "concurrency-down",
+                    IconName::Remove,
+                    self.config.max_concurrent_sessions > MIN_CONCURRENT_SESSIONS,
+                    palette,
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.adjust_concurrency(-1, cx))),
+            )
+            .child(
+                div()
+                    .w(px(32.))
+                    .text_center()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(self.config.max_concurrent_sessions.to_string()),
+            )
+            .child(
+                stepper_button(
+                    "concurrency-up",
+                    IconName::Add,
+                    self.config.max_concurrent_sessions < MAX_CONCURRENT_SESSIONS,
+                    palette,
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.adjust_concurrency(1, cx))),
+            );
+        let queue_group = settings_group(
+            vec![
+                settings_row(
+                    "同时运行",
+                    "最多同时进行的任务数，其余任务按顺序排队等待",
+                    concurrency.into_any_element(),
+                    palette,
+                ),
+                settings_block(
+                    "繁忙提示短语",
+                    "Codex 的回复以这些内容开头时视为高峰繁忙并重新排队，用 | 分隔",
+                    text_field(&self.phrases_input, palette),
+                    palette,
+                ),
+            ],
+            palette,
+        );
+
+        let auto_send = self.config.auto_send_default_prompt;
+        let startup_group = settings_group(
+            vec![
+                settings_row(
+                    "启动时自动发送",
+                    "打开 Longwatch 后把下面的消息作为新任务加入队列；关闭时它只用来预填输入框",
+                    switch("auto-send", auto_send, palette)
+                        .on_click(cx.listener(|view, _, _, cx| view.toggle_auto_send(cx)))
+                        .into_any_element(),
+                    palette,
+                ),
+                settings_block(
+                    "默认消息",
+                    "留空则每次启动显示空白输入框",
+                    text_field(&self.default_prompt_input, palette),
+                    palette,
+                ),
+            ],
+            palette,
+        );
+
+        let identity = self.config.client_identity;
+        let mut segmented = div()
+            .flex()
+            .gap(px(2.))
+            .p(px(2.))
+            .rounded(px(10.))
+            .bg(rgb(palette.fill_secondary));
+        for option in ClientIdentity::ALL {
+            let selected = option == identity;
+            segmented = segmented.child(
+                div()
+                    .id(ElementId::Name(format!("identity-{option:?}").into()))
+                    .h(px(26.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .when(selected, |this| {
+                        this.bg(rgb(palette.base))
+                            .text_color(rgb(palette.text))
+                            .font_weight(FontWeight::MEDIUM)
+                            .shadow(palette.soft_shadow())
+                    })
+                    .when(!selected, |this| {
+                        this.text_color(rgb(palette.text_secondary))
+                            .hover(move |style| style.text_color(rgb(palette.text)))
+                    })
+                    .child(option.label())
+                    .on_click(cx.listener(move |view, _, _, cx| view.set_identity(option, cx))),
+            );
+        }
+        let (cli_description, cli_pill) = match &self.codex_cli {
+            None => (
+                "正在检测 Codex CLI…".to_owned(),
+                status_pill("检测中", palette.text_quaternary, palette),
+            ),
+            Some(cli) if cli.available() => (
+                format!("{} · {}", cli.version_label(), cli.path_label()),
+                status_pill("可用", palette.success, palette),
+            ),
+            Some(cli) => (
+                format!("未找到可用的 Codex CLI：{}", cli.path_label()),
+                status_pill("需要检查", palette.error, palette),
+            ),
+        };
+        let connection_group = settings_group(
+            vec![
+                settings_block(
+                    "请求身份",
+                    identity_description(identity),
+                    div().flex().child(segmented).into_any_element(),
+                    palette,
+                ),
+                settings_row("Codex 程序", cli_description, cli_pill, palette),
+            ],
+            palette,
+        );
+
+        let alert_group = settings_group(
+            vec![settings_row(
+                "完成提示音",
+                "任务完成时除系统通知外再播放提示音",
+                switch("audio-alert", self.config.audio_alert_enabled, palette)
+                    .on_click(cx.listener(|view, _, _, cx| view.toggle_audio(cx)))
+                    .into_any_element(),
+                palette,
+            )],
+            palette,
+        );
+
+        let diagnostics_group = settings_group(
+            vec![settings_row(
+                "诊断信息",
+                transport_status_text(&self.snapshot),
+                div()
+                    .flex()
+                    .gap(px(4.))
+                    .child(
+                        text_button(
+                            "copy-diagnostics",
+                            Some(if self.diagnostics_copied {
+                                IconName::Check
+                            } else {
+                                IconName::Copy
+                            }),
+                            if self.diagnostics_copied {
+                                "已复制"
+                            } else {
+                                "复制诊断"
+                            },
+                            ButtonStyle::Outline,
+                            palette,
+                        )
+                        .on_click(
+                            cx.listener(|view, _, window, cx| view.copy_diagnostics(window, cx)),
+                        ),
+                    )
+                    .child(
+                        text_button(
+                            "open-logs",
+                            Some(IconName::FolderOpen),
+                            "打开日志",
+                            ButtonStyle::Outline,
+                            palette,
+                        )
+                        .on_click(cx.listener(|view, _, window, cx| view.open_logs(window, cx))),
+                    )
+                    .into_any_element(),
+                palette,
+            )],
+            palette,
+        );
+
+        let back = text_button(
+            "close-settings",
+            Some(IconName::ChevronLeft),
+            "返回队列",
+            ButtonStyle::Ghost,
+            palette,
+        )
+        .on_click(cx.listener(|view, _, _, cx| view.close_settings(cx)));
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(content_header(
+                "设置".into(),
+                self.header_space - 140.,
+                None,
+                back.into_any_element(),
+                palette,
+            ))
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .px(px(28.))
+                            .pb(px(40.))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(680.))
+                                    .flex()
+                                    .flex_col()
+                                    .child(settings_section("队列", queue_group, palette))
+                                    .child(settings_section("启动", startup_group, palette))
+                                    .child(settings_section("连接", connection_group, palette))
+                                    .child(settings_section("提醒", alert_group, palette))
+                                    .child(settings_section("诊断", diagnostics_group, palette)),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_exit_dialog(&self, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let running = self.snapshot.running_session_count;
+        let waiting = self.snapshot.pending_tasks.len();
+        let work = match (running, waiting) {
+            (0, waiting) => format!("还有 {waiting} 个任务在排队"),
+            (running, 0) => format!("还有 {running} 个任务正在进行"),
+            (running, waiting) => format!("还有 {running} 个任务正在进行、{waiting} 个在排队"),
+        };
+        div()
+            .id("exit-dialog")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .occlude()
+            .bg(rgba(palette.mask))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(400.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .p(px(24.))
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(palette.border_tertiary))
+                    .bg(rgb(palette.surface))
+                    .shadow(palette.overlay_shadow())
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .line_height(px(24.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("退出 Longwatch？"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .line_height(px(20.))
+                            .text_color(rgb(palette.text_secondary))
+                            .child(format!("{work}。退出后排队会停止，这些任务不会自动恢复。")),
+                    )
+                    .child(
+                        div()
+                            .pt(px(8.))
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                text_button(
+                                    "cancel-exit",
+                                    None,
+                                    "取消",
+                                    ButtonStyle::Outline,
+                                    palette,
+                                )
+                                .on_click(cx.listener(
+                                    |view, _, _, cx| {
+                                        view.exit_confirm_open = false;
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                text_button(
+                                    "confirm-exit",
+                                    None,
+                                    "退出",
+                                    ButtonStyle::Danger,
+                                    palette,
+                                )
+                                .on_click(cx.listener(
+                                    |view, _, window, cx| {
+                                        view.confirm_exit(window, cx);
+                                    },
+                                )),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Building blocks
+// ---------------------------------------------------------------------------
+
+/// Sidebar groups, in the order they are shown.
+struct QueueLists<'a> {
+    running: Vec<&'a QueueSessionSummary>,
+    waiting: Vec<(usize, &'a PendingTaskSummary)>,
+    paused: Vec<&'a QueueSessionSummary>,
+    finished: Vec<&'a QueueSessionSummary>,
+}
+
+impl<'a> QueueLists<'a> {
+    fn from_snapshot(snapshot: &'a QueueSnapshot) -> Self {
+        let visible = snapshot
+            .sessions
+            .iter()
+            .filter(|session| session.has_history);
+        let running = visible.clone().filter(|session| session.active).collect();
+        let paused = visible
+            .clone()
+            .filter(|session| {
+                !session.active
+                    && matches!(session.phase, QueuePhase::Paused | QueuePhase::FatalError)
+            })
+            .collect();
+        let mut finished = visible
+            .filter(|session| session_is_finished(session))
+            .collect::<Vec<_>>();
+        finished.sort_by(|left, right| {
+            right
+                .reply_completed_at
+                .cmp(&left.reply_completed_at)
+                .then(right.id.cmp(&left.id))
+        });
+        Self {
+            running,
+            waiting: snapshot
+                .pending_tasks
+                .iter()
+                .enumerate()
+                .map(|(index, task)| (index + 1, task))
+                .collect(),
+            paused,
+            finished,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.running.is_empty()
+            && self.waiting.is_empty()
+            && self.paused.is_empty()
+            && self.finished.is_empty()
+    }
+}
+
+fn session_is_finished(session: &QueueSessionSummary) -> bool {
+    session.has_history
+        && !session.active
+        && matches!(session.phase, QueuePhase::Success | QueuePhase::Idle)
+}
+
+fn window_control(area: WindowControlArea, palette: Palette, maximized: bool) -> impl IntoElement {
+    let close = area == WindowControlArea::Close;
+    let glyph: AnyElement = match area {
+        WindowControlArea::Min => div()
+            .w(px(10.))
+            .h(px(1.))
+            .bg(rgb(palette.text_secondary))
+            .into_any_element(),
+        WindowControlArea::Max if maximized => div()
+            .size(px(10.))
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(2.))
+                    .size(px(8.))
+                    .border_1()
+                    .border_color(rgb(palette.text_secondary)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .left(px(0.))
+                    .size(px(8.))
+                    .border_1()
+                    .border_color(rgb(palette.text_secondary))
+                    .bg(rgb(palette.shell)),
+            )
+            .into_any_element(),
+        WindowControlArea::Max => div()
+            .size(px(10.))
+            .border_1()
+            .border_color(rgb(palette.text_secondary))
+            .into_any_element(),
+        _ => Icon::new(IconName::Close)
+            .size(px(14.))
+            .color(rgb(palette.text_secondary))
+            .into_any_element(),
+    };
     div()
-        .w(px(44.))
+        .w(px(46.))
         .h_full()
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .window_control_area(area)
-        .text_size(px(14.))
-        .text_color(rgb(palette.text_secondary))
-        .hover(move |element| {
+        .hover(move |style| {
             if close {
-                element.bg(rgb(0xd54941)).text_color(rgb(0xffffff))
+                style.bg(rgb(0xc42b1c))
             } else {
-                element.bg(rgb(palette.hover)).text_color(rgb(palette.text))
+                style.bg(rgba(palette.hover))
             }
         })
-        .child(symbol)
+        .child(glyph)
 }
 
-fn setting_row(
-    title: &'static str,
-    description: &'static str,
-    symbol: IconName,
-    switch: impl IntoElement,
-    enabled: bool,
-    badge: Option<&'static str>,
-    palette: UiPalette,
+fn section_heading(
+    label: &'static str,
+    count: Option<String>,
+    action: Option<AnyElement>,
+    palette: Palette,
 ) -> impl IntoElement {
     div()
+        .h(px(28.))
+        .mt(px(8.))
         .flex()
         .items_center()
-        .gap_3()
-        .p_3()
-        .rounded(px(INNER_RADIUS))
-        .border_1()
-        .border_color(rgb(palette.border_soft))
-        .bg(rgb(palette.surface))
+        .gap(px(6.))
+        .px(px(8.))
         .child(
             div()
-                .w(px(34.))
-                .h(px(34.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(palette.text_tertiary))
+                .child(label),
+        )
+        .when_some(count, |this, count| {
+            this.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(palette.text_quaternary))
+                    .child(count),
+            )
+        })
+        .child(div().flex_1())
+        .when_some(action, |this, action| this.child(action))
+}
+
+fn task_row(
+    id: ElementId,
+    selected: bool,
+    indicator: AnyElement,
+    title: String,
+    meta: String,
+    meta_color: u32,
+    palette: Palette,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_start()
+        .gap(px(9.))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(8.))
+        .cursor_pointer()
+        .when(selected, |this| this.bg(rgba(palette.active)))
+        .when(!selected, |this| {
+            this.hover(move |style| style.bg(rgba(palette.hover)))
+        })
+        .child(
+            div()
+                .w(px(14.))
+                .h(px(18.))
                 .flex_none()
-                .rounded(px(6.))
-                .bg(if enabled {
-                    rgb(palette.brand_soft)
-                } else {
-                    rgb(palette.surface_alt)
-                })
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(if enabled {
-                    rgb(palette.brand)
-                } else {
-                    rgb(palette.text_muted)
-                })
-                .child(Icon::new(symbol).size(px(17.)).color(if enabled {
-                    rgb(palette.brand)
-                } else {
-                    rgb(palette.text_muted)
-                })),
+                .child(indicator),
         )
         .child(
             div()
@@ -1645,275 +2697,470 @@ fn setting_row(
                 .min_w(px(0.))
                 .flex()
                 .flex_col()
-                .gap_1()
+                .gap(px(1.))
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title)
-                        .when_some(badge, |this, badge| {
-                            this.child(setting_badge(badge, palette))
-                        }),
+                        .w(px(ROW_TEXT_WIDTH))
+                        .text_size(px(13.))
+                        .line_height(px(18.))
+                        .text_color(rgb(if selected {
+                            palette.text
+                        } else {
+                            palette.text_secondary
+                        }))
+                        .truncate()
+                        .child(title),
                 )
                 .child(
                     div()
-                        .text_sm()
-                        .text_color(rgb(palette.text_muted))
-                        .child(description),
+                        .w(px(ROW_TEXT_WIDTH))
+                        .text_size(px(11.))
+                        .line_height(px(15.))
+                        .text_color(rgb(meta_color))
+                        .truncate()
+                        .child(meta),
                 ),
         )
-        .child(switch)
 }
 
-fn setting_tile(
-    title: &'static str,
-    description: &'static str,
-    symbol: IconName,
-    switch: impl IntoElement,
+fn session_indicator(session: &QueueSessionSummary, palette: Palette) -> AnyElement {
+    let dot = |color: u32| {
+        div()
+            .size(px(8.))
+            .rounded_full()
+            .bg(rgb(color))
+            .into_any_element()
+    };
+    let icon = |name: IconName, color: u32| {
+        Icon::new(name)
+            .size(px(13.))
+            .color(rgb(color))
+            .into_any_element()
+    };
+    match session.phase {
+        QueuePhase::Backoff => dot(palette.warning),
+        _ if session.active => dot(palette.primary),
+        QueuePhase::Success => icon(IconName::Check, palette.success),
+        QueuePhase::Paused => icon(IconName::Pause, palette.text_tertiary),
+        QueuePhase::FatalError => icon(IconName::ErrorCircle, palette.error),
+        _ => dot(palette.text_quaternary),
+    }
+}
+
+/// Hollow ring: queued, not started yet.
+fn queued_ring(palette: Palette) -> AnyElement {
+    div()
+        .size(px(9.))
+        .rounded_full()
+        .border_2()
+        .border_color(rgb(palette.text_quaternary))
+        .into_any_element()
+}
+
+fn session_tone(session: &QueueSessionSummary, palette: Palette) -> u32 {
+    match session.phase {
+        QueuePhase::Backoff => palette.warning,
+        _ if session.active => palette.primary,
+        QueuePhase::Success => palette.success,
+        QueuePhase::FatalError => palette.error,
+        _ => palette.text_tertiary,
+    }
+}
+
+fn status_pill(label: &str, tone: u32, palette: Palette) -> AnyElement {
+    div()
+        .flex_none()
+        .h(px(22.))
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .px(px(8.))
+        .rounded_full()
+        .border_1()
+        .border_color(rgb(palette.border_tertiary))
+        .bg(rgb(palette.elevated))
+        .child(div().size(px(6.)).rounded_full().bg(rgb(tone)))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(palette.text_secondary))
+                .child(label.to_owned()),
+        )
+        .into_any_element()
+}
+
+fn content_header(
+    title: String,
+    title_budget: f32,
+    pill: Option<AnyElement>,
+    actions: AnyElement,
+    palette: Palette,
+) -> AnyElement {
+    let title = ellipsize(&title, title_budget, 13.);
+    div()
+        .h(px(48.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .px(px(16.))
+        .border_b_1()
+        .border_color(rgb(palette.border_tertiary))
+        .child(
+            div()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(palette.text))
+                .child(title),
+        )
+        .when_some(pill, |this, pill| this.child(pill))
+        .child(div().flex_1())
+        .child(actions)
+        .into_any_element()
+}
+
+fn text_button(
+    id: &'static str,
+    icon: Option<IconName>,
+    label: &'static str,
+    style: ButtonStyle,
+    palette: Palette,
+) -> Stateful<Div> {
+    let (background, foreground, hover, border) = match style {
+        ButtonStyle::Ghost => (None, palette.text_secondary, palette.fill_secondary, None),
+        ButtonStyle::Outline => (
+            Some(palette.base),
+            palette.text,
+            palette.fill_secondary,
+            Some(palette.border_tertiary),
+        ),
+        ButtonStyle::Primary => (
+            Some(palette.primary),
+            palette.on_primary,
+            palette.primary_hover,
+            None,
+        ),
+        ButtonStyle::DangerGhost => (None, palette.error, palette.error_bg, None),
+        ButtonStyle::Danger => (Some(palette.error), 0xffffff, palette.error, None),
+    };
+    div()
+        .id(id)
+        .h(px(28.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .px(px(10.))
+        .rounded(px(8.))
+        .when_some(background, |this, color| this.bg(rgb(color)))
+        .when_some(border, |this, color| {
+            this.border_1().border_color(rgb(color))
+        })
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(foreground))
+        .cursor_pointer()
+        .hover(move |this| {
+            if style == ButtonStyle::Danger {
+                this.opacity(0.9)
+            } else {
+                this.bg(rgb(hover))
+            }
+        })
+        .when_some(icon, |this, icon| {
+            this.child(Icon::new(icon).size(px(14.)).color(rgb(foreground)))
+        })
+        .child(label)
+}
+
+fn stepper_button(
+    id: &'static str,
+    icon: IconName,
     enabled: bool,
-    badge: Option<&'static str>,
-    palette: UiPalette,
+    palette: Palette,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(28.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(7.))
+        .when(enabled, |this| {
+            this.cursor_pointer()
+                .hover(move |style| style.bg(rgb(palette.fill_secondary)))
+        })
+        .child(Icon::new(icon).size(px(14.)).color(rgb(if enabled {
+            palette.text_secondary
+        } else {
+            palette.text_quaternary
+        })))
+}
+
+/// Qoder's MD switch: 32×20 track, 16 px thumb.
+fn switch(id: &'static str, on: bool, palette: Palette) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(32.))
+        .h(px(20.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .px(px(2.))
+        .rounded_full()
+        .bg(rgb(if on {
+            palette.primary
+        } else {
+            palette.switch_off
+        }))
+        .cursor_pointer()
+        .when(on, |this| this.justify_end())
+        .child(
+            div()
+                .size(px(16.))
+                .rounded_full()
+                .bg(rgb(if on && palette.dark {
+                    palette.on_primary
+                } else {
+                    0xffffff
+                })),
+        )
+}
+
+fn text_field(state: &Entity<InputState>, palette: Palette) -> AnyElement {
+    div()
+        .h(px(32.))
+        .px(px(4.))
+        .flex()
+        .items_center()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(rgb(palette.border_tertiary))
+        .bg(rgb(palette.base))
+        .text_size(px(13.))
+        .child(
+            Input::new(state)
+                .appearance(false)
+                .bordered(false)
+                .focus_bordered(false),
+        )
+        .into_any_element()
+}
+
+fn settings_section(title: &'static str, group: AnyElement, palette: Palette) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .h(px(44.))
+                .flex()
+                .items_end()
+                .px(px(4.))
+                .pb(px(8.))
+                .text_size(px(12.))
+                .text_color(rgb(palette.text_tertiary))
+                .child(title),
+        )
+        .child(group)
+}
+
+fn settings_group(rows: Vec<AnyElement>, palette: Palette) -> AnyElement {
+    let count = rows.len();
+    let mut group = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .px(px(16.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(rgb(palette.border_tertiary))
+        .bg(rgb(palette.surface))
+        .shadow(palette.soft_shadow());
+    for (index, row) in rows.into_iter().enumerate() {
+        group = group.child(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .when(index + 1 < count, |this| {
+                    this.border_b_1()
+                        .border_dashed()
+                        .border_color(rgb(palette.border_tertiary))
+                })
+                .child(row),
+        );
+    }
+    group.into_any_element()
+}
+
+fn settings_text(
+    title: &'static str,
+    description: impl Into<SharedString>,
+    palette: Palette,
 ) -> impl IntoElement {
     div()
         .flex_1()
         .min_w(px(0.))
         .flex()
-        .items_center()
-        .gap_2()
-        .p_2()
-        .rounded(px(INNER_RADIUS))
-        .border_1()
-        .border_color(rgb(palette.border_soft))
-        .bg(rgb(palette.surface))
+        .flex_col()
+        .gap(px(2.))
         .child(
             div()
-                .w(px(30.))
-                .h(px(30.))
-                .flex_none()
-                .rounded(px(6.))
-                .bg(if enabled {
-                    rgb(palette.brand_soft)
-                } else {
-                    rgb(palette.surface_alt)
-                })
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(if enabled {
-                    rgb(palette.brand)
-                } else {
-                    rgb(palette.text_muted)
-                })
-                .child(Icon::new(symbol).size(px(16.)).color(if enabled {
-                    rgb(palette.brand)
-                } else {
-                    rgb(palette.text_muted)
-                })),
+                .text_size(px(13.))
+                .line_height(px(20.))
+                .text_color(rgb(palette.text))
+                .child(title),
         )
         .child(
             div()
-                .flex_1()
-                .min_w(px(0.))
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title)
-                        .when_some(badge, |this, badge| {
-                            this.child(setting_badge(badge, palette))
-                        }),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(palette.text_muted))
-                        .child(description),
-                ),
-        )
-        .child(switch)
-}
-
-fn setting_badge(text: &'static str, palette: UiPalette) -> impl IntoElement {
-    div()
-        .h(px(16.))
-        .flex_none()
-        .px_1()
-        .rounded(px(3.))
-        .bg(rgb(palette.brand_soft))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(px(10.))
-        .font_weight(FontWeight::NORMAL)
-        .text_color(rgb(palette.brand))
-        .child(text)
-}
-
-fn settings_action_button(
-    id: &'static str,
-    label: &'static str,
-    icon: IconName,
-    color: gpui::Rgba,
-    palette: UiPalette,
-) -> Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .focusable()
-        .h(px(30.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .rounded(px(6.))
-        .text_xs()
-        .text_color(color)
-        .cursor_pointer()
-        .hover(move |this| this.bg(rgb(palette.hover)))
-        .child(Icon::new(icon).size(px(14.)).color(color))
-        .child(label)
-}
-
-fn diagnostic_card(
-    diagnostic: &str,
-    ok: bool,
-    cli_status: &str,
-    transport_status: &str,
-    action: impl IntoElement,
-    palette: UiPalette,
-) -> impl IntoElement {
-    let diagnostic = diagnostic.to_owned();
-    let cli_status = cli_status.to_owned();
-    let transport_status = transport_status.to_owned();
-    div()
-        .rounded(px(INNER_RADIUS))
-        .border_1()
-        .border_color(rgb(palette.border_soft))
-        .bg(rgb(palette.surface))
-        .overflow_hidden()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(palette.border_soft))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(palette.text))
-                                .child("运行诊断"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(palette.text_muted))
-                                .child(cli_status),
-                        ),
-                )
-                .child(
-                    Tag::new(if ok { "运行正常" } else { "需要检查" }).theme(if ok {
-                        TagTheme::Success
-                    } else {
-                        TagTheme::Danger
-                    }),
-                )
-                .child(action),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_3()
-                .text_xs()
-                .text_color(rgb(palette.text_secondary))
-                .child(format!("Codex CLI · {diagnostic}"))
-                .child(format!("连接通道 · {transport_status}"))
-                .child("后台窗口已隐藏，提醒行为按开关执行"),
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(rgb(palette.text_tertiary))
+                .child(description.into()),
         )
 }
 
-fn label(text: &'static str, palette: UiPalette) -> impl IntoElement {
+fn settings_row(
+    title: &'static str,
+    description: impl Into<SharedString>,
+    control: AnyElement,
+    palette: Palette,
+) -> AnyElement {
     div()
-        .text_sm()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(palette.text_secondary))
-        .child(text)
-}
-
-fn icon_action_button(
-    id: &'static str,
-    icon: IconName,
-    icon_color: gpui::Rgba,
-    palette: UiPalette,
-) -> Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .focusable()
-        .w(px(28.))
-        .h(px(28.))
-        .flex_none()
-        .rounded(px(7.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .text_color(icon_color)
-        .hover(move |this| this.bg(rgb(palette.hover)))
-        .child(Icon::new(icon).size(px(17.)).color(icon_color))
-}
-
-fn rounded_field(state: Entity<InputState>, palette: UiPalette) -> impl IntoElement {
-    div()
-        .id(("rounded-field", state.entity_id()))
         .w_full()
-        .rounded(px(INNER_RADIUS))
-        .overflow_hidden()
-        .border_1()
-        .border_color(rgb(palette.border))
-        .bg(rgb(palette.surface))
-        .child(
-            ThemedInput::new(&state)
-                .appearance(false)
-                .bordered(false)
-                .focus_bordered(false),
-        )
+        .flex()
+        .items_center()
+        .gap(px(16.))
+        .py(px(14.))
+        .child(settings_text(title, description, palette))
+        .child(div().flex_none().child(control))
+        .into_any_element()
 }
 
-fn composer_field(state: Entity<InputState>, palette: UiPalette) -> impl IntoElement {
+fn settings_block(
+    title: &'static str,
+    description: impl Into<SharedString>,
+    control: AnyElement,
+    palette: Palette,
+) -> AnyElement {
     div()
-        .id(("composer-field", state.entity_id()))
-        .size_full()
-        .overflow_hidden()
-        .bg(rgb(palette.surface))
-        .child(
-            ThemedInput::new(&state)
-                .appearance(false)
-                .bordered(false)
-                .focus_bordered(false)
-                .h_full(),
-        )
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .py(px(14.))
+        .child(settings_text(title, description, palette))
+        // A column stretches the control to the full row width.
+        .child(div().flex().flex_col().child(control))
+        .into_any_element()
 }
 
-fn chat_text_view_style(palette: UiPalette) -> TextViewStyle {
+fn empty_state(text: &'static str, palette: Palette) -> AnyElement {
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(13.))
+        .text_color(rgb(palette.text_tertiary))
+        .child(text)
+        .into_any_element()
+}
+
+fn user_bubble(text: &str, palette: Palette) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .justify_end()
+        .child(
+            div()
+                .max_w(px(560.))
+                .px(px(14.))
+                .py(px(10.))
+                .rounded(px(16.))
+                .bg(rgb(palette.primary_bg))
+                .text_size(px(13.))
+                .line_height(px(20.))
+                .text_color(rgb(palette.text))
+                .whitespace_normal()
+                .child(text.trim().to_owned()),
+        )
+        .into_any_element()
+}
+
+fn render_message(
+    session_id: u64,
+    index: usize,
+    message: &ConversationMessage,
+    palette: Palette,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    match message.role {
+        ConversationRole::User => user_bubble(&message.content, palette),
+        // Automatic assistant entries are Longwatch's own terminal notices
+        // (for example why a task was paused), not Codex prose.
+        _ if message.automatic => div()
+            .w_full()
+            .flex()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(8.))
+            .rounded(px(10.))
+            .bg(rgb(palette.error_bg))
+            .child(
+                Icon::new(IconName::InfoCircle)
+                    .size(px(14.))
+                    .color(rgb(palette.error)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(rgb(palette.error))
+                    .child(message.content.clone()),
+            )
+            .into_any_element(),
+        _ => div()
+            .w_full()
+            .text_size(px(14.))
+            .line_height(px(24.))
+            .text_color(rgb(palette.text))
+            .child(
+                TextView::markdown(
+                    ElementId::Name(
+                        format!(
+                            "reply-{session_id}-{index}-{}",
+                            if palette.dark { "dark" } else { "light" }
+                        )
+                        .into(),
+                    ),
+                    chat_markdown_source(&message.content),
+                    window,
+                    cx,
+                )
+                .style(
+                    chat_text_view_style(palette)
+                        .paragraph_gap(gpui::rems(0.5))
+                        .heading_font_size(|level, base| match level {
+                            1..=2 => base * 1.15,
+                            3 => base * 1.05,
+                            _ => base,
+                        })
+                        .code_block(StyleRefinement::default().mt(gpui::rems(0.55))),
+                ),
+            )
+            .into_any_element(),
+    }
+}
+
+fn chat_text_view_style(palette: Palette) -> TextViewStyle {
     TextViewStyle {
         highlight_theme: if palette.dark {
             gpui_component::highlighter::HighlightTheme::default_dark().clone()
@@ -1925,718 +3172,254 @@ fn chat_text_view_style(palette: UiPalette) -> TextViewStyle {
     }
 }
 
-fn status_icon_name(snapshot: &QueueSnapshot) -> IconName {
-    match snapshot.phase {
-        QueuePhase::Idle => IconName::Play,
-        QueuePhase::Connecting => IconName::Link,
-        QueuePhase::Sending => IconName::SendFilled,
-        QueuePhase::Waiting if is_retry_status(&snapshot.status_message) => IconName::Refresh,
-        QueuePhase::Waiting => IconName::Loading,
-        QueuePhase::Backoff => IconName::HourglassFilled,
-        QueuePhase::Success => IconName::CheckCircleFilled,
-        QueuePhase::Paused => IconName::Pause,
-        QueuePhase::FatalError => IconName::ErrorCircleFilled,
-    }
-}
+// ---------------------------------------------------------------------------
+// Labels and text helpers
+// ---------------------------------------------------------------------------
 
-fn status_icon(
-    snapshot: &QueueSnapshot,
-    accent: gpui::Rgba,
-    palette: UiPalette,
-) -> impl IntoElement {
-    let phase = snapshot.phase;
-    let icon = status_icon_name(snapshot);
-    let icon_size = match phase {
-        QueuePhase::Success => 35.,
-        QueuePhase::FatalError => 31.,
-        QueuePhase::Waiting => 29.,
-        _ => 28.,
-    };
-    let icon_element = match phase {
-        QueuePhase::Idle => svg()
-            .path(icon.asset_path())
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .text_color(accent)
-            .with_animation(
-                "status-icon-idle",
-                Animation::new(Duration::from_millis(2200)).repeat(),
-                |icon, delta| {
-                    let wave = 0.5 + 0.5 * (delta * std::f32::consts::TAU).sin();
-                    let scale = 0.96 + 0.04 * wave;
-                    icon.opacity(0.82 + 0.18 * wave)
-                        .with_transformation(Transformation::scale(size(scale, scale)))
-                },
-            )
-            .into_any_element(),
-        QueuePhase::Connecting => svg()
-            .path(icon.asset_path())
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .text_color(accent)
-            .with_animation(
-                "status-icon-connecting",
-                Animation::new(Duration::from_millis(1500)).repeat(),
-                |icon, delta| {
-                    let wave = (delta * std::f32::consts::TAU).sin();
-                    let scale = 0.98 + 0.025 * wave.abs();
-                    icon.with_transformation(
-                        Transformation::rotate(percentage(0.018 * wave))
-                            .with_scaling(size(scale, scale)),
-                    )
-                },
-            )
-            .into_any_element(),
-        QueuePhase::Sending => svg()
-            .path(icon.asset_path())
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .text_color(accent)
-            .with_animation(
-                "status-icon-sending",
-                Animation::new(Duration::from_millis(1200)).repeat(),
-                |icon, delta| {
-                    let lift = 0.5 - 0.5 * (delta * std::f32::consts::TAU).cos();
-                    icon.opacity(0.82 + 0.18 * lift).with_transformation(
-                        Transformation::translate(point(px(2.2 * lift), px(-2.2 * lift)))
-                            .with_scaling(size(0.98 + 0.025 * lift, 0.98 + 0.025 * lift)),
-                    )
-                },
-            )
-            .into_any_element(),
-        QueuePhase::Waiting => svg()
-            .path(icon.asset_path())
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .text_color(accent)
-            .with_animation(
-                "status-icon-waiting",
-                Animation::new(Duration::from_millis(900)).repeat(),
-                |icon, delta| icon.with_transformation(Transformation::rotate(percentage(delta))),
-            )
-            .into_any_element(),
-        QueuePhase::Backoff => svg()
-            .path(icon.asset_path())
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .text_color(accent)
-            .with_animation(
-                "status-icon-backoff",
-                Animation::new(Duration::from_millis(2600)).repeat(),
-                |icon, delta| {
-                    let flip = if delta < 0.42 {
-                        0.
-                    } else if delta < 0.68 {
-                        let progress = ((delta - 0.42) / 0.26).clamp(0., 1.);
-                        let eased = progress * progress * (3. - 2. * progress);
-                        0.5 * eased
-                    } else {
-                        0.5
-                    };
-                    icon.with_transformation(Transformation::rotate(percentage(flip)))
-                },
-            )
-            .into_any_element(),
-        QueuePhase::Success => svg()
-            .path(icon.asset_path())
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .text_color(accent)
-            .into_any_element(),
-        QueuePhase::Paused => svg()
-            .path(icon.asset_path())
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .text_color(accent)
-            .with_animation(
-                "status-icon-paused",
-                Animation::new(Duration::from_millis(2400)).repeat(),
-                |icon, delta| {
-                    let wave = 0.5 + 0.5 * (delta * std::f32::consts::TAU).sin();
-                    let scale = 0.98 + 0.02 * wave;
-                    icon.opacity(0.74 + 0.2 * wave)
-                        .with_transformation(Transformation::scale(size(scale, scale)))
-                },
-            )
-            .into_any_element(),
-        QueuePhase::FatalError => svg()
-            .path(icon.asset_path())
-            .w(px(icon_size))
-            .h(px(icon_size))
-            .text_color(accent)
-            .with_animation(
-                "status-icon-error",
-                Animation::new(Duration::from_millis(420)),
-                |icon, delta| {
-                    let shake = (delta * std::f32::consts::TAU * 3.).sin() * (1. - delta) * 2.4;
-                    icon.with_transformation(Transformation::translate(point(px(shake), px(0.))))
-                },
-            )
-            .into_any_element(),
-    };
-    let halo = div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-        .rounded_full()
-        .bg(status_icon_halo(phase, palette));
-    let halo = if matches!(
-        phase,
-        QueuePhase::Idle
-            | QueuePhase::Connecting
-            | QueuePhase::Sending
-            | QueuePhase::Waiting
-            | QueuePhase::Backoff
-            | QueuePhase::Paused
-    ) {
-        halo.with_animation(
-            "status-icon-halo",
-            Animation::new(Duration::from_millis(1900)).repeat(),
-            |halo, delta| {
-                let wave = 0.5 + 0.5 * (delta * std::f32::consts::TAU).sin();
-                halo.opacity(0.45 + 0.4 * wave)
+/// Messages shown for a session: its conversation plus the answer that is
+/// still streaming.
+fn timeline_entries(snapshot: &QueueSnapshot) -> Vec<ConversationMessage> {
+    let mut entries = snapshot.conversation.clone();
+    if !entries
+        .iter()
+        .any(|message| message.role == ConversationRole::User)
+        && !snapshot.session_prompt.trim().is_empty()
+    {
+        entries.insert(
+            0,
+            ConversationMessage {
+                role: ConversationRole::User,
+                content: snapshot.session_prompt.clone(),
+                automatic: false,
             },
-        )
-        .into_any_element()
-    } else {
-        halo.into_any_element()
-    };
-    div()
-        .relative()
-        .w(px(58.))
-        .h(px(58.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(halo)
-        .child(
-            div()
-                .relative()
-                .w(px(46.))
-                .h(px(46.))
-                .rounded_full()
-                .border_1()
-                .border_color(status_icon_border(phase, palette))
-                .bg(status_icon_surface(phase, palette))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon_element),
-        )
-}
-
-fn status_icon_surface(phase: QueuePhase, palette: UiPalette) -> gpui::Rgba {
-    if palette.dark {
-        return match phase {
-            QueuePhase::Connecting
-            | QueuePhase::Sending
-            | QueuePhase::Waiting
-            | QueuePhase::Backoff => rgb(palette.warning_soft),
-            QueuePhase::Success => rgb(palette.success_soft),
-            QueuePhase::FatalError => rgb(palette.error_soft),
-            QueuePhase::Idle | QueuePhase::Paused => rgb(palette.surface),
-        };
+        );
     }
-    match phase {
-        QueuePhase::Connecting
-        | QueuePhase::Sending
-        | QueuePhase::Waiting
-        | QueuePhase::Backoff => rgba(0xfffcf9ff),
-        QueuePhase::Idle | QueuePhase::Success | QueuePhase::Paused => rgba(0xffffffff),
-        QueuePhase::FatalError => rgba(0xfffbfaff),
+    let streaming = matches!(snapshot.phase, QueuePhase::Sending | QueuePhase::Waiting)
+        && !snapshot.reply_preview_is_notice
+        && !snapshot.reply_preview.trim().is_empty();
+    if streaming
+        && !entries.last().is_some_and(|message| {
+            message.role == ConversationRole::Assistant && message.content == snapshot.reply_preview
+        })
+    {
+        entries.push(ConversationMessage {
+            role: ConversationRole::Assistant,
+            content: snapshot.reply_preview.clone(),
+            automatic: false,
+        });
     }
+    entries
 }
 
-fn status_icon_border(phase: QueuePhase, palette: UiPalette) -> gpui::Rgba {
-    if palette.dark {
-        return status_surface_border(phase, palette);
+/// The final answer of a finished turn, for copying.
+fn final_reply(snapshot: &QueueSnapshot) -> Option<String> {
+    if !matches!(snapshot.phase, QueuePhase::Success | QueuePhase::Idle) {
+        return None;
     }
-    match phase {
-        QueuePhase::Idle => rgb(0xd5dcda),
-        QueuePhase::Connecting
-        | QueuePhase::Sending
-        | QueuePhase::Waiting
-        | QueuePhase::Backoff => rgb(0xf0c7a7),
-        QueuePhase::Success => rgb(0xb9dfcf),
-        QueuePhase::Paused => rgb(0xd4d7d6),
-        QueuePhase::FatalError => rgb(0xe9b7b0),
-    }
+    snapshot
+        .conversation
+        .iter()
+        .rev()
+        .find(|message| message.role == ConversationRole::Assistant && !message.automatic)
+        .map(|message| message.content.clone())
 }
 
-fn status_icon_halo(phase: QueuePhase, palette: UiPalette) -> gpui::Rgba {
-    if palette.dark {
-        return match phase {
-            QueuePhase::Idle => rgba(0xaab8b02e),
-            QueuePhase::Connecting
-            | QueuePhase::Sending
-            | QueuePhase::Waiting
-            | QueuePhase::Backoff => rgba(0xe9a23b35),
-            QueuePhase::Success => rgba(0x43c99738),
-            QueuePhase::Paused => rgba(0xaab8b029),
-            QueuePhase::FatalError => rgba(0xff958a33),
-        };
-    }
-    match phase {
-        QueuePhase::Idle => rgba(0x66736f24),
-        QueuePhase::Connecting
-        | QueuePhase::Sending
-        | QueuePhase::Waiting
-        | QueuePhase::Backoff => rgba(0xe373182b),
-        QueuePhase::Success => rgba(0x16a67340),
-        QueuePhase::Paused => rgba(0x77777720),
-        QueuePhase::FatalError => rgba(0xd5494126),
-    }
-}
-
-fn success_completion_background() -> impl IntoElement {
-    const COLUMNS: usize = 15;
-    const ROWS: usize = 5;
-
-    // Preserve the original subtle dot matrix. Celebration motion is layered
-    // above it and never replaces or recolors this texture.
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .bottom_0()
-        .children((0..COLUMNS * ROWS).map(move |index| {
-            let column = index % COLUMNS;
-            let row = index / COLUMNS;
-            let pattern = (column * 7 + row * 11) % 17;
-            let alpha = match pattern {
-                0 | 1 => 0x3a,
-                2..=5 => 0x2a,
-                6..=10 => 0x20,
-                _ => 0x15,
-            };
-            let x = 24. + column as f32 * 28. + if row % 2 == 0 { 0. } else { 4. };
-            let y = 20. + row as f32 * 28.;
-            div()
-                .absolute()
-                .left(px(x))
-                .top(px(y))
-                .w(px(3.))
-                .h(px(3.))
-                .rounded_full()
-                .bg(rgba(0x16a67300 | alpha))
-                .into_any_element()
-        }))
-        .with_animation(
-            "success-dot-shimmer",
-            Animation::new(Duration::from_millis(2800)).repeat(),
-            |this, delta| {
-                let shimmer = 0.5 + 0.5 * (delta * std::f32::consts::TAU).sin();
-                this.opacity(0.56 + 0.44 * shimmer)
-            },
-        )
-}
-
-fn success_feedback_overlay(burst_id: u64) -> impl IntoElement {
-    const WIDTH: f32 = 420.;
-    const HEIGHT: f32 = 180.;
-    const SPARKS: [(f32, f32, f32, u32, f32); 24] = [
-        (0.05, 18., 0.00, 0x2f9c78, 5.),
-        (0.13, 76., 0.18, 0x58aeb0, 4.),
-        (0.21, 132., 0.34, 0xd7a13d, 5.),
-        (0.29, 42., 0.48, 0x2f9c78, 4.),
-        (0.36, 108., 0.12, 0x58aeb0, 5.),
-        (0.44, 22., 0.28, 0xd7a13d, 4.),
-        (0.51, 146., 0.42, 0x2f9c78, 5.),
-        (0.58, 34., 0.56, 0x58aeb0, 4.),
-        (0.64, 118., 0.08, 0x2f9c78, 5.),
-        (0.71, 58., 0.22, 0xd7a13d, 4.),
-        (0.78, 142., 0.38, 0x58aeb0, 5.),
-        (0.85, 28., 0.52, 0x2f9c78, 4.),
-        (0.92, 96., 0.14, 0xd7a13d, 5.),
-        (0.08, 126., 0.30, 0x58aeb0, 4.),
-        (0.24, 12., 0.46, 0x2f9c78, 4.),
-        (0.76, 14., 0.06, 0x58aeb0, 4.),
-        (0.89, 134., 0.26, 0x2f9c78, 4.),
-        (0.97, 66., 0.44, 0xd7a13d, 5.),
-        (0.18, 162., 0.20, 0x2f9c78, 4.),
-        (0.32, 92., 0.40, 0x58aeb0, 5.),
-        (0.48, 154., 0.58, 0xd7a13d, 4.),
-        (0.62, 8., 0.16, 0x2f9c78, 5.),
-        (0.74, 52., 0.32, 0x58aeb0, 4.),
-        (0.86, 116., 0.50, 0xd7a13d, 5.),
-    ];
-
-    div()
-        .absolute()
-        .left(px(-(WIDTH - 58.) / 2.))
-        .top(px(-(HEIGHT - 58.) / 2.))
-        .w(px(WIDTH))
-        .h(px(HEIGHT))
-        .children(
-            SPARKS
-                .into_iter()
-                .enumerate()
-                .map(move |(index, (x, y, delay, color, size))| {
-                    let animation_key = burst_id.wrapping_mul(64).wrapping_add(index as u64);
-                    let cross = index % 3 != 1;
-                    let particle_size = size * 1.4;
-                    let stroke = 1.6;
-                    div()
-                        .absolute()
-                        .left(relative(x))
-                        .top(px(y))
-                        .w(px(particle_size))
-                        .h(px(particle_size))
-                        .when(cross, |this| {
-                            this.child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top(px((particle_size - stroke) / 2.))
-                                    .w_full()
-                                    .h(px(stroke))
-                                    .rounded_full()
-                                    .bg(rgb(color)),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px((particle_size - stroke) / 2.))
-                                    .top_0()
-                                    .w(px(stroke))
-                                    .h_full()
-                                    .rounded_full()
-                                    .bg(rgb(color)),
-                            )
-                        })
-                        .when(!cross, |this| this.rounded_full().bg(rgb(color)))
-                        .with_animation(
-                            ("success-spark", animation_key),
-                            Animation::new(Duration::from_millis(2400)).repeat(),
-                            move |this, delta| {
-                                let progress = (delta + delay).fract();
-                                let pulse =
-                                    (std::f32::consts::PI * progress).sin().max(0.).powf(0.72);
-                                this.opacity(0.92 * pulse)
-                            },
-                        )
-                        .into_any_element()
-                }),
-        )
-}
-
-fn metric_panel_heading(
-    title: &'static str,
-    summary: Option<String>,
-    accent: gpui::Rgba,
-    palette: UiPalette,
-) -> gpui::Div {
-    let heading = div()
-        .h(px(36.))
-        .flex_none()
-        .flex()
-        .items_start()
-        .gap_2()
-        .px_3()
-        .pt_2()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(palette.text))
-                .child(title),
-        )
-        .child(div().flex_1());
-    if let Some(summary) = summary {
-        heading.child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(accent)
-                .child(summary),
-        )
-    } else {
-        heading
-    }
-}
-
-fn animated_attempt_route(
-    attempt_count: u64,
-    retry_count: u32,
-    phase: QueuePhase,
-    accent: gpui::Rgba,
-    motion_frame: u8,
-    palette: UiPalette,
-) -> impl IntoElement {
-    let stage: usize = match phase {
-        QueuePhase::Connecting => 1,
-        QueuePhase::Sending => 2,
-        QueuePhase::Waiting | QueuePhase::Backoff => 3,
-        QueuePhase::Success => 4,
-        QueuePhase::Paused | QueuePhase::FatalError if attempt_count > 0 => 3,
-        QueuePhase::Idle | QueuePhase::Paused | QueuePhase::FatalError => 0,
-    };
-    let running = matches!(
-        phase,
-        QueuePhase::Connecting | QueuePhase::Sending | QueuePhase::Waiting | QueuePhase::Backoff
-    );
-    let pulse_on = running && motion_frame % 2 == 0;
-    let route_progress = stage as f32 / 4.;
-
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .child(metric_panel_heading(
-            "任务进度",
-            Some(format!("尝试 {attempt_count} 次 · 重试 {retry_count} 轮")),
-            accent,
-            palette,
-        ))
-        .child(
-            div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .px_3()
-                .pb_3()
-                .child(
-                    div()
-                        .w_full()
-                        .relative()
-                        .flex()
-                        .child(
-                            div()
-                                .absolute()
-                                .left(relative(0.1))
-                                .right(relative(0.1))
-                                .top(px(7.5))
-                                .h(px(3.))
-                                .bg(rgb(palette.inactive_border))
-                                .child(div().h_full().w(relative(route_progress)).bg(accent)),
-                        )
-                        .children(
-                            ["开始", "连接", "发送", "处理", "完成"]
-                                .into_iter()
-                                .enumerate()
-                                .map(move |(index, label)| {
-                                    let completed = index < stage
-                                        || (phase == QueuePhase::Success && index == 4);
-                                    let current = index == stage;
-                                    let active = completed || current;
-                                    let dot_size = if current && pulse_on { 16. } else { 14. };
-                                    div()
-                                        .flex_1()
-                                        .flex()
-                                        .flex_col()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .flex()
-                                                .items_center()
-                                                .child(div().flex_1().h(px(3.)))
-                                                .child(
-                                                    div()
-                                                        .w(px(18.))
-                                                        .h(px(18.))
-                                                        .flex_none()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .child(
-                                                            div()
-                                                                .w(px(dot_size))
-                                                                .h(px(dot_size))
-                                                                .rounded_full()
-                                                                .when(!active, |this| {
-                                                                    this.border_1()
-                                                                        .border_color(rgb(
-                                                                            palette.inactive_border,
-                                                                        ))
-                                                                })
-                                                                .bg(if active {
-                                                                    accent
-                                                                } else {
-                                                                    rgb(palette.surface)
-                                                                }),
-                                                        ),
-                                                )
-                                                .child(div().flex_1().h(px(3.))),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(if index <= stage {
-                                                    accent
-                                                } else {
-                                                    rgb(palette.text_muted)
-                                                })
-                                                .child(label),
-                                        )
-                                }),
-                        ),
-                ),
-        )
-}
-
-const ATTEMPT_GRID_ROWS: u64 = 5;
-const ATTEMPT_GRID_COLUMNS: u64 = 18;
-
-const fn attempt_grid_index(row: u64, column: u64) -> u64 {
-    row * ATTEMPT_GRID_COLUMNS + column
-}
-
-fn attempt_grid(attempt_count: u64, accent: gpui::Rgba, palette: UiPalette) -> impl IntoElement {
-    const CELL_COUNT: u64 = ATTEMPT_GRID_ROWS * ATTEMPT_GRID_COLUMNS;
-    let active_cells = attempt_count.min(CELL_COUNT);
-    div()
-        .w_full()
-        .h_full()
-        .flex()
-        .flex_col()
-        .child(metric_panel_heading("尝试轨迹", None, accent, palette))
-        .child(
-            div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .px_3()
-                .pb_2()
-                .child(div().w_full().flex().flex_col().gap_1().children(
-                    (0..ATTEMPT_GRID_ROWS).map(move |row| {
-                        div()
-                            .w_full()
-                            .flex()
-                            .gap_1()
-                            .children((0..ATTEMPT_GRID_COLUMNS).map(move |column| {
-                                // Fill each row from left to right before moving down.
-                                let index = attempt_grid_index(row, column);
-                                let active = index < active_cells;
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .h(px(14.))
-                                    .rounded(px(3.))
-                                    .border_1()
-                                    .border_color(if active {
-                                        accent
-                                    } else {
-                                        rgb(palette.inactive_border)
-                                    })
-                                    .bg(if active {
-                                        accent
-                                    } else {
-                                        rgb(palette.inactive)
-                                    })
-                            }))
-                    }),
-                )),
-        )
-}
-
-fn status_surface(phase: QueuePhase, palette: UiPalette) -> gpui::Rgba {
-    if palette.dark {
-        return match phase {
-            QueuePhase::Success => rgb(palette.success_soft),
-            QueuePhase::Idle | QueuePhase::Paused => rgb(palette.surface_alt),
-            QueuePhase::Connecting
-            | QueuePhase::Sending
-            | QueuePhase::Waiting
-            | QueuePhase::Backoff => rgb(palette.warning_soft),
-            QueuePhase::FatalError => rgb(palette.error_soft),
-        };
-    }
-    match phase {
-        QueuePhase::Success => rgba(0xf4faf7ff),
-        QueuePhase::Idle => rgba(0xf7f8f8ff),
-        QueuePhase::Connecting
-        | QueuePhase::Sending
-        | QueuePhase::Waiting
-        | QueuePhase::Backoff => rgba(0xfff7f0ff),
-        QueuePhase::FatalError => rgba(0xfff5f3ff),
-        QueuePhase::Paused => rgba(0xf7f7f7ff),
-    }
-}
-
-fn status_surface_border(phase: QueuePhase, palette: UiPalette) -> gpui::Rgba {
-    if palette.dark {
-        return match phase {
-            QueuePhase::Success => rgb(0x347359),
-            QueuePhase::Idle | QueuePhase::Paused => rgb(palette.border),
-            QueuePhase::Connecting
-            | QueuePhase::Sending
-            | QueuePhase::Waiting
-            | QueuePhase::Backoff => rgb(0x795534),
-            QueuePhase::FatalError => rgb(0x75413d),
-        };
-    }
-    match phase {
-        QueuePhase::Success => rgb(0xd3e9df),
-        QueuePhase::Idle => rgb(0xdde2e0),
-        QueuePhase::Connecting
-        | QueuePhase::Sending
-        | QueuePhase::Waiting
-        | QueuePhase::Backoff => rgb(0xf2ceb2),
-        QueuePhase::FatalError => rgb(0xf0c7c1),
-        QueuePhase::Paused => rgb(0xdedede),
-    }
-}
-
-fn tag_theme(phase: QueuePhase) -> TagTheme {
-    match phase {
-        QueuePhase::Success => TagTheme::Success,
-        QueuePhase::Connecting
-        | QueuePhase::Sending
-        | QueuePhase::Waiting
-        | QueuePhase::Backoff => TagTheme::Warning,
-        QueuePhase::FatalError => TagTheme::Danger,
-        QueuePhase::Paused | QueuePhase::Idle => TagTheme::Default,
-    }
-}
-
-fn reply_tag_label(phase: QueuePhase) -> &'static str {
-    match phase {
+fn session_state_label(session: &QueueSessionSummary) -> &'static str {
+    match session.phase {
+        QueuePhase::Connecting if session.status_message.contains("恢复") => "恢复连接中",
+        QueuePhase::Connecting => "连接中",
+        QueuePhase::Sending => "发送中",
+        QueuePhase::Waiting if is_retry_status(&session.status_message) => "自动重试中",
+        QueuePhase::Waiting => "处理中",
+        QueuePhase::Backoff => "等待重试",
         QueuePhase::Success => "已完成",
-        QueuePhase::Connecting
-        | QueuePhase::Sending
-        | QueuePhase::Waiting
-        | QueuePhase::Backoff => "排队中",
-        QueuePhase::FatalError => "需处理",
-        QueuePhase::Idle | QueuePhase::Paused => "等待中",
+        QueuePhase::Paused => "已暂停",
+        QueuePhase::FatalError => "需要处理",
+        QueuePhase::Idle if session.active => "准备中",
+        QueuePhase::Idle => "已停止",
     }
 }
 
-fn conversation_waiting_text(phase: QueuePhase) -> &'static str {
-    match phase {
-        QueuePhase::Connecting => "正在连接 Codex…",
-        QueuePhase::Sending => "正在发送任务…",
-        QueuePhase::Waiting => "正在处理，请稍候…",
-        QueuePhase::Backoff => "当前服务繁忙，已安排下一次重试…",
-        QueuePhase::Paused => "对话已暂停，继续后将恢复排队。",
-        QueuePhase::FatalError => "当前任务需要处理，请检查状态后重新开始。",
-        QueuePhase::Success => "任务已完成，正在整理最终回复。",
-        QueuePhase::Idle => "等待发送任务…",
+fn session_meta(session: &QueueSessionSummary, now: DateTime<Utc>) -> String {
+    let label = session_state_label(session);
+    match session.phase {
+        QueuePhase::Backoff => match session.next_attempt_at {
+            Some(next) => format!(
+                "{}重试 · 已尝试 {} 次",
+                compact_eta(next, now),
+                session.attempt_count.max(1)
+            ),
+            None => label.to_owned(),
+        },
+        QueuePhase::Connecting | QueuePhase::Sending | QueuePhase::Waiting => session
+            .first_attempt_at
+            .and_then(|since| elapsed_label(since, now))
+            .map_or_else(
+                || label.to_owned(),
+                |elapsed| format!("{label} · {elapsed}"),
+            ),
+        QueuePhase::Success => session.reply_completed_at.map_or_else(
+            || label.to_owned(),
+            |done| format!("{label} · {}", clock_label(done)),
+        ),
+        _ => label.to_owned(),
     }
 }
 
-fn conversation_text(snapshot: &QueueSnapshot) -> String {
-    if !snapshot.reply_preview.trim().is_empty() {
-        return snapshot.reply_preview.clone();
-    }
-
-    let status = snapshot.status_message.trim();
-    let status_is_codex_output = matches!(
-        snapshot.phase,
-        QueuePhase::Backoff | QueuePhase::Paused | QueuePhase::FatalError
-    ) || (snapshot.phase == QueuePhase::Waiting
-        && is_retry_status(status));
-    if status_is_codex_output && !status.is_empty() {
-        status.to_owned()
+/// "12 秒后" / "3 分钟后" / "14:05 " — always followed by an action word.
+fn compact_eta(next: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let remaining = (next - now).num_seconds();
+    if remaining <= 0 {
+        "即将".into()
+    } else if remaining < 60 {
+        format!("{remaining} 秒后")
+    } else if remaining < 60 * 60 {
+        format!("{} 分钟后", (remaining + 30) / 60)
     } else {
-        conversation_waiting_text(snapshot.phase).to_owned()
+        format!("{} ", clock_label(next))
+    }
+}
+
+fn elapsed_label(since: DateTime<Utc>, now: DateTime<Utc>) -> Option<String> {
+    let seconds = (now - since).num_seconds();
+    if seconds < 60 {
+        None
+    } else if seconds < 60 * 60 {
+        Some(format!("{} 分钟", seconds / 60))
+    } else {
+        let minutes = (seconds % 3600) / 60;
+        if minutes == 0 {
+            Some(format!("{} 小时", seconds / 3600))
+        } else {
+            Some(format!("{} 小时 {minutes} 分", seconds / 3600))
+        }
+    }
+}
+
+fn clock_label(timestamp: DateTime<Utc>) -> String {
+    let local = timestamp.with_timezone(&chrono::Local);
+    if local.date_naive() == chrono::Local::now().date_naive() {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%m月%d日 %H:%M").to_string()
+    }
+}
+
+fn is_retry_status(status: &str) -> bool {
+    let normalized = status.to_ascii_lowercase();
+    status.contains("重试")
+        || status.contains("恢复")
+        || normalized.contains("reconnecting")
+        || normalized.contains("disconnected")
+        || normalized.contains("error sending request")
+}
+
+fn strip_status_prefix(status: &str) -> String {
+    ["Codex 正在内部重试：", "Codex 正在静默重试："]
+        .iter()
+        .find_map(|prefix| status.strip_prefix(prefix))
+        .unwrap_or(status)
+        .to_owned()
+}
+
+/// Cut `text` to roughly `max_width` pixels with a trailing ellipsis. gpui
+/// cannot ellipsize text whose width is only known after flex layout, so
+/// variable-width labels are shortened up front using a glyph-width estimate.
+fn ellipsize(text: &str, max_width: f32, font_size: f32) -> String {
+    let glyph_width = |character: char| {
+        if character.is_ascii() {
+            font_size * 0.56
+        } else {
+            font_size
+        }
+    };
+    let total: f32 = text.chars().map(glyph_width).sum();
+    if total <= max_width.max(0.) {
+        return text.to_owned();
+    }
+    let budget = (max_width - font_size).max(font_size * 2.);
+    let mut used = 0.;
+    let mut shortened = String::new();
+    for character in text.chars() {
+        used += glyph_width(character);
+        if used > budget {
+            break;
+        }
+        shortened.push(character);
+    }
+    shortened.truncate(shortened.trim_end().len());
+    shortened.push('…');
+    shortened
+}
+
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn folder_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+fn parse_phrases(input: &str) -> Vec<String> {
+    input
+        .split('|')
+        .map(str::trim)
+        .filter(|phrase| !phrase.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn cli_short_label(cli: &CodexCliInfo) -> String {
+    match cli.version.as_deref() {
+        Some(version) => version
+            .trim()
+            .trim_start_matches("codex-cli")
+            .trim()
+            .to_owned(),
+        None => "未找到 Codex".into(),
+    }
+}
+
+fn identity_description(identity: ClientIdentity) -> String {
+    let detail = match identity {
+        ClientIdentity::OfficialDesktop => "与 ChatGPT 桌面应用发出的请求一致",
+        ClientIdentity::CodexCli => "与 Codex 命令行一致",
+        ClientIdentity::Longwatch => "标明请求来自 Longwatch",
+    };
+    format!(
+        "originator: {} · {detail}。修改后，从下一次连接开始生效",
+        identity.originator()
+    )
+}
+
+fn transport_status_text(snapshot: &QueueSnapshot) -> String {
+    let status = &snapshot.transport_status;
+    if status.connected {
+        status.server_agent.as_ref().map_or_else(
+            || format!("{} · 已连接", status.kind.label()),
+            |agent| format!("已连接 · {agent}"),
+        )
+    } else {
+        "任务开始时自动连接 Codex app-server；问题反馈可附上诊断信息（不含任务原文与凭据）".into()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn tray_status(snapshot: &QueueSnapshot) -> String {
+    let running = snapshot.running_session_count;
+    let waiting = snapshot.pending_tasks.len();
+    match (running, waiting) {
+        (0, 0) => "空闲".into(),
+        (running, 0) => format!("{running} 个任务进行中"),
+        (0, waiting) => format!("{waiting} 个任务排队中"),
+        (running, waiting) => format!("{running} 个进行中 · {waiting} 个排队"),
     }
 }
 
@@ -2706,162 +3489,9 @@ fn normalize_markdown_list_line(line: &str) -> String {
     format!("{indentation}{marker}{rest}")
 }
 
-fn simple_status_title(snapshot: &QueueSnapshot) -> &'static str {
-    match snapshot.phase {
-        QueuePhase::Idle => "等待开始",
-        QueuePhase::Connecting if snapshot.status_message.contains("恢复") => "正在恢复连接",
-        QueuePhase::Connecting => "正在连接 Codex",
-        QueuePhase::Sending => "正在发送任务",
-        QueuePhase::Waiting if is_retry_status(&snapshot.status_message) => "Codex 正在自动重试",
-        QueuePhase::Waiting => "Codex 正在处理",
-        QueuePhase::Backoff => "等待下一次重试",
-        QueuePhase::Success => "任务已完成",
-        QueuePhase::Paused => "队列已暂停",
-        QueuePhase::FatalError => "运行需要处理",
-    }
-}
-
-fn is_retry_status(status: &str) -> bool {
-    let normalized = status.to_ascii_lowercase();
-    status.contains("重试")
-        || normalized.contains("reconnecting")
-        || normalized.contains("disconnected")
-        || normalized.contains("error sending request")
-}
-
-fn friendly_phase(phase: QueuePhase) -> &'static str {
-    match phase {
-        QueuePhase::Idle => "准备就绪",
-        QueuePhase::Connecting => "正在连接",
-        QueuePhase::Sending => "正在发送",
-        QueuePhase::Waiting => "处理中",
-        QueuePhase::Backoff => "稍后重试",
-        QueuePhase::Success => "已完成",
-        QueuePhase::Paused => "已暂停",
-        QueuePhase::FatalError => "需要处理",
-    }
-}
-
-fn transport_status_text(snapshot: &QueueSnapshot) -> String {
-    let status = &snapshot.transport_status;
-    if status.connected {
-        status.server_agent.as_ref().map_or_else(
-            || format!("{} · 已连接", status.kind.label()),
-            |agent| format!("{} · 已连接 · {agent}", status.kind.label()),
-        )
-    } else if snapshot.phase == QueuePhase::Idle {
-        "尚未连接 · 开始任务后自动启动 app-server".into()
-    } else {
-        format!("{} · 未连接，正在由队列恢复", status.kind.label())
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn update_tray_state(snapshot: &QueueSnapshot) {
-    let control = match snapshot.phase {
-        QueuePhase::Connecting
-        | QueuePhase::Sending
-        | QueuePhase::Waiting
-        | QueuePhase::Backoff => gpui_platform::TrayControl::Pause,
-        QueuePhase::Paused => gpui_platform::TrayControl::Resume,
-        QueuePhase::Idle | QueuePhase::Success | QueuePhase::FatalError => {
-            gpui_platform::TrayControl::Disabled
-        }
-    };
-    gpui_platform::set_tray_state(
-        friendly_phase(snapshot.phase),
-        control,
-        snapshot.active_thread_id.is_some(),
-    );
-}
-
-fn primary_action_label(phase: QueuePhase) -> &'static str {
-    match phase {
-        QueuePhase::Connecting
-        | QueuePhase::Sending
-        | QueuePhase::Waiting
-        | QueuePhase::Backoff => "停止",
-        QueuePhase::Paused => "继续当前会话",
-        QueuePhase::Idle | QueuePhase::Success | QueuePhase::FatalError => "发送消息",
-    }
-}
-
-fn phase_color(phase: QueuePhase, palette: UiPalette) -> gpui::Rgba {
-    if palette.dark {
-        return match phase {
-            QueuePhase::Success => rgb(palette.brand),
-            QueuePhase::Idle | QueuePhase::Paused => rgb(palette.text_secondary),
-            QueuePhase::Connecting
-            | QueuePhase::Sending
-            | QueuePhase::Waiting
-            | QueuePhase::Backoff => rgb(0xe9a23b),
-            QueuePhase::FatalError => rgb(palette.error),
-        };
-    }
-    match phase {
-        QueuePhase::Success => rgb(0x16a673),
-        QueuePhase::Idle => rgb(0x66736f),
-        QueuePhase::Connecting
-        | QueuePhase::Sending
-        | QueuePhase::Waiting
-        | QueuePhase::Backoff => rgb(0xe37318),
-        QueuePhase::Paused => rgb(0x777777),
-        QueuePhase::FatalError => rgb(0xd54941),
-    }
-}
-
-fn phase_detail(phase: QueuePhase, next: Option<&str>, retry_round: u32) -> String {
-    match phase {
-        QueuePhase::Idle => "填写任务后即可开始排队".into(),
-        QueuePhase::Connecting => "正在建立 Codex app-server 连接".into(),
-        QueuePhase::Sending => "任务正在原样发送给 Codex".into(),
-        QueuePhase::Waiting => "正在等待 Codex 完成当前回合".into(),
-        QueuePhase::Backoff => next.map_or_else(
-            || format!("第 {} 轮退避 · 已安排下一次低频重试", retry_round.max(1)),
-            |next| format!("第 {} 轮退避 · {next}重试", retry_round.max(1)),
-        ),
-        QueuePhase::Success => String::new(),
-        QueuePhase::Paused => "已暂停，不会自动发送新的回合".into(),
-        QueuePhase::FatalError => "请检查配置或 Codex 运行状态后重新开始".into(),
-    }
-}
-
-fn next_attempt_label(next: Option<chrono::DateTime<chrono::Utc>>) -> Option<String> {
-    Some(next_attempt_label_at(next?, chrono::Utc::now()))
-}
-
-fn reply_time_label(timestamp: chrono::DateTime<chrono::Utc>) -> String {
-    timestamp
-        .with_timezone(&chrono::Local)
-        .format("%H:%M")
-        .to_string()
-}
-
-fn next_attempt_label_at(
-    next: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> String {
-    let remaining = (next - now).num_seconds().max(0);
-    let local = next.with_timezone(&chrono::Local);
-    let today = now.with_timezone(&chrono::Local).date_naive();
-    if remaining == 0 {
-        return "即将".into();
-    }
-    if remaining < 90 {
-        return format!("约 {remaining} 秒后（{}）", local.format("%H:%M:%S"));
-    }
-    if remaining < 60 * 60 {
-        let minutes = (remaining + 30) / 60;
-        return format!("约 {minutes} 分钟后（{}）", local.format("%H:%M"));
-    }
-    if local.date_naive() == today {
-        format!("今天 {}", local.format("%H:%M"))
-    } else if local.date_naive() == today + chrono::Duration::days(1) {
-        format!("明天 {}", local.format("%H:%M"))
-    } else {
-        local.format("%m月%d日 %H:%M").to_string()
-    }
-}
+// ---------------------------------------------------------------------------
+// Application entry
+// ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
 fn windows_hwnd(window: &Window) -> Option<isize> {
@@ -2885,6 +3515,109 @@ fn sync_macos_icon_for_window(window: &Window) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn new_view(
+    config: QueueConfig,
+    snapshot: QueueSnapshot,
+    commands: tokio::sync::mpsc::Sender<RuntimeCommand>,
+    config_directory: PathBuf,
+    logs_directory: PathBuf,
+    closing: Arc<AtomicBool>,
+    startup_auto_sent: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<QueueView> {
+    let logo = Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        include_bytes!("../packaging/ui-logo.png").to_vec(),
+    ));
+    let initial_prompt = if startup_auto_sent {
+        String::new()
+    } else {
+        config.default_prompt.clone()
+    };
+    let prompt_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .multi_line(true)
+            .default_value(initial_prompt)
+            .placeholder("描述要交给 Codex 的任务，按 Enter 加入队列")
+    });
+    let default_prompt_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .default_value(config.default_prompt.clone())
+            .placeholder("例如：继续完成上次的任务")
+    });
+    let phrases_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .default_value(config.failure_phrases.join(" | "))
+            .placeholder("Server overloaded; retry later.")
+    });
+    cx.new(|cx| {
+        let subscriptions = vec![
+            cx.subscribe(
+                &prompt_input,
+                |view: &mut QueueView, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        view.prompt_error = false;
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe(
+                &default_prompt_input,
+                |view: &mut QueueView, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Blur) {
+                        view.save_text_settings(cx);
+                    }
+                },
+            ),
+            cx.subscribe(
+                &phrases_input,
+                |view: &mut QueueView, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Blur) {
+                        view.save_text_settings(cx);
+                    }
+                },
+            ),
+        ];
+        QueueView {
+            config,
+            snapshot,
+            commands,
+            selection: Selection::New,
+            initial_selection_pending: true,
+            requested_session: None,
+            page: Page::Queue,
+            prompt_input,
+            default_prompt_input,
+            phrases_input,
+            placeholder: "描述要交给 Codex 的任务，按 Enter 加入队列",
+            codex_cli: None,
+            logo,
+            next_request_id: 0,
+            pending_clear: None,
+            awaiting_placement: None,
+            prompt_error: false,
+            timeline_scroll: ScrollHandle::new(),
+            reply_copied: false,
+            diagnostics_copied: false,
+            notice: None,
+            notice_counter: 0,
+            exit_confirm_open: false,
+            closing,
+            runtime_stopped: false,
+            last_slow_refresh: Instant::now(),
+            header_space: 600.,
+            #[cfg(target_os = "windows")]
+            tray_status: String::new(),
+            config_directory,
+            logs_directory,
+            _subscriptions: subscriptions,
+            appearance_subscription: None,
+        }
+    })
+}
+
 pub fn run(
     config: QueueConfig,
     runtime: RuntimeHandle,
@@ -2894,7 +3627,6 @@ pub fn run(
     let shutdown_runtime = Arc::clone(&tokio_runtime);
     let commands = runtime.command_sender();
     let mut snapshots = runtime.snapshot();
-    let codex_cli = diagnostics::inspect_codex_cli(&config.codex_path);
     let config_directory = ConfigStore::discover()
         .map(|store| store.directory().to_path_buf())
         .unwrap_or_else(|_| PathBuf::from("."));
@@ -2903,18 +3635,17 @@ pub fn run(
         .with_assets(TDesignAssetSource::new())
         .run(move |cx: &mut App| {
             tdesign_gpui::init(cx);
-            // Markdown replies use gpui-component's TextView. Initialize its
-            // key bindings/theme globals alongside the existing TDesign shell.
+            // Markdown replies and text inputs come from gpui-component.
             gpui_component::init(cx);
             let closing = Arc::new(AtomicBool::new(false));
-            let titlebar_inset = if cfg!(target_os = "windows") { 32. } else { 0. };
-            let window_size = size(px(1000.), px(612. + titlebar_inset));
-            let bounds = Bounds::centered(None, window_size, cx);
-            #[cfg(target_os = "windows")]
-            let initial_for_tray = snapshots.borrow().clone();
-            let view_closing = Arc::clone(&closing);
-            let queue_view_slot = Rc::new(RefCell::new(None));
-            let queue_view_slot_for_window = Rc::clone(&queue_view_slot);
+            let titlebar_inset = if cfg!(target_os = "windows") {
+                TITLEBAR_HEIGHT
+            } else {
+                0.
+            };
+            let bounds = Bounds::centered(None, size(px(1120.), px(720. + titlebar_inset)), cx);
+            let view_slot = Rc::new(RefCell::new(None));
+            let view_slot_for_window = Rc::clone(&view_slot);
             let window = cx
                 .open_window(
                     WindowOptions {
@@ -2925,122 +3656,45 @@ pub fn run(
                             ..Default::default()
                         }),
                         app_id: Some("Longwatch.Codex".into()),
-                        is_resizable: false,
-                        window_min_size: Some(window_size),
+                        is_resizable: true,
+                        window_min_size: Some(size(px(880.), px(560. + titlebar_inset))),
                         ..Default::default()
                     },
                     {
                         let config = config.clone();
                         let commands = commands.clone();
                         let initial = snapshots.borrow().clone();
-                        let initial_burst_id = u64::from(initial.phase == QueuePhase::Success);
-                        let codex_cli = codex_cli.clone();
                         let config_directory = config_directory.clone();
                         let logs_directory = logs_directory.clone();
+                        let closing = Arc::clone(&closing);
                         move |app_window, cx| {
-                            let logo_image = Arc::new(Image::from_bytes(
-                                ImageFormat::Png,
-                                include_bytes!("../packaging/ui-logo.png").to_vec(),
-                            ));
-                            let prompt_value = if startup_auto_sent {
-                                String::new()
-                            } else {
-                                config.default_prompt.clone()
-                            };
-                            let prompt_input = cx.new(|cx| {
-                                InputState::new(app_window, cx)
-                                    .multi_line(true)
-                                    .default_value(prompt_value)
-                                    .placeholder("输入一条真实、有意义的任务")
-                            });
-                            let default_prompt_input = cx.new(|cx| {
-                                InputState::new(app_window, cx)
-                                    .default_value(config.default_prompt.clone())
-                                    .placeholder("留空则每次启动显示空输入框")
-                            });
-                            let cwd_value = config
-                                .working_directory
-                                .as_ref()
-                                .map_or_else(String::new, |path| path.display().to_string());
-                            let cwd_input = cx.new(|cx| {
-                                InputState::new(app_window, cx)
-                                    .default_value(cwd_value)
-                                    .placeholder("留空则继承 Codex 默认工作目录")
-                            });
-                            let phrases_input = cx.new(|cx| {
-                                InputState::new(app_window, cx)
-                                    .default_value(config.failure_phrases.join(" | "))
-                                    .placeholder("Server overloaded; retry later...")
-                            });
-                            let auto_send_toggle =
-                                ToggleState::new(cx, config.auto_send_default_prompt);
-                            let full_screen_toggle =
-                                ToggleState::new(cx, config.full_screen_flash_enabled);
-                            let audio_toggle = ToggleState::new(cx, config.audio_alert_enabled);
-                            let view = cx.new(|_| QueueView {
-                                celebration_burst_id: initial_burst_id,
+                            // `codex --version` goes through a node shim that can
+                            // take seconds; never make the window wait for it.
+                            let codex_path = config.codex_path.clone();
+                            let view = new_view(
                                 config,
-                                snapshot: initial,
+                                initial,
                                 commands,
-                                prompt_input,
-                                default_prompt_input,
-                                cwd_input,
-                                phrases_input,
-                                auto_send_toggle,
-                                full_screen_toggle,
-                                audio_toggle,
-                                logo_image,
-                                codex_cli,
-                                advanced_open: false,
-                                route_motion_frame: 0,
-                                prompt_error: false,
-                                next_request_id: 0,
-                                pending_clear_request: None,
-                                pending_clear_text: None,
-                                conversation_scroll: ScrollHandle::new(),
-                                copy_feedback: CopyFeedback::Idle,
-                                diagnostic_copy_feedback: CopyFeedback::Idle,
                                 config_directory,
                                 logs_directory,
-                                appearance_subscription: None,
-                            });
-                            let animated_view = view.clone();
-                            let animated_closing = Arc::clone(&view_closing);
+                                Arc::clone(&closing),
+                                startup_auto_sent,
+                                app_window,
+                                cx,
+                            );
+                            // Countdowns, elapsed times and tray actions.
+                            let ticking_view = view.clone();
+                            let ticking_window = Window::window_handle(app_window);
                             cx.spawn(async move |cx| {
                                 loop {
-                                    Timer::after(Duration::from_millis(520)).await;
-                                    if animated_closing.load(Ordering::Acquire) {
+                                    Timer::after(Duration::from_millis(500)).await;
+                                    if closing.load(Ordering::Acquire) {
                                         break;
                                     }
-                                    if animated_view
-                                        .update(cx, |view, cx| {
-                                            #[cfg(target_os = "windows")]
-                                            if let Some(action) = gpui_platform::take_tray_action()
-                                            {
-                                                match action {
-                                                    gpui_platform::TrayAction::Pause => {
-                                                        let _ = view.send(RuntimeCommand::Pause);
-                                                    }
-                                                    gpui_platform::TrayAction::Resume => {
-                                                        let _ = view.send(RuntimeCommand::Resume);
-                                                    }
-                                                    gpui_platform::TrayAction::OpenResult => {
-                                                        view.open_thread_now();
-                                                    }
-                                                }
-                                                cx.notify();
-                                            }
-                                            if matches!(
-                                                view.snapshot.phase,
-                                                QueuePhase::Connecting
-                                                    | QueuePhase::Sending
-                                                    | QueuePhase::Waiting
-                                                    | QueuePhase::Backoff
-                                            ) {
-                                                view.route_motion_frame =
-                                                    view.route_motion_frame.wrapping_add(1);
-                                                cx.notify();
-                                            }
+                                    if ticking_window
+                                        .update(cx, |_root, window, cx| {
+                                            ticking_view
+                                                .update(cx, |view, cx| view.tick(window, cx));
                                         })
                                         .is_err()
                                     {
@@ -3049,13 +3703,25 @@ pub fn run(
                                 }
                             })
                             .detach();
-                            *queue_view_slot_for_window.borrow_mut() = Some(view.clone());
+                            let detection = cx
+                                .background_executor()
+                                .spawn(async move { diagnostics::inspect_codex_cli(&codex_path) });
+                            let detected_view = view.clone();
+                            cx.spawn(async move |cx| {
+                                let info = detection.await;
+                                let _ = detected_view.update(cx, |view, cx| {
+                                    view.codex_cli = Some(info);
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                            *view_slot_for_window.borrow_mut() = Some(view.clone());
                             cx.new(|cx| ComponentRoot::new(view, app_window, cx))
                         }
                     },
                 )
                 .expect("failed to open Longwatch window");
-            let queue_view = queue_view_slot
+            let queue_view = view_slot
                 .borrow_mut()
                 .take()
                 .expect("Longwatch queue view was not initialized");
@@ -3079,13 +3745,7 @@ pub fn run(
                 #[cfg(target_os = "windows")]
                 let tray_available = native_window.is_some_and(|native_window| {
                     match gpui_platform::install_tray(native_window) {
-                        Ok(()) => {
-                            // `window.update` already holds a mutable lease for
-                            // QueueView. Reading the entity here would re-enter
-                            // that lease and trigger GPUI's double-borrow panic.
-                            update_tray_state(&initial_for_tray);
-                            true
-                        }
+                        Ok(()) => true,
                         Err(error) => {
                             warn!(%error, "系统托盘初始化失败，将保留传统关闭行为");
                             false
@@ -3093,33 +3753,36 @@ pub fn run(
                     }
                 });
                 let close_flag = Arc::clone(&closing);
+                // Never block in here: a native modal box would pump this
+                // window's messages while GPUI is mid-update. Confirmation is
+                // an in-window dialog instead.
                 app_window.on_window_should_close(cx, move |_, app| {
-                    let active = matches!(
-                        view.read(app).snapshot.phase,
-                        QueuePhase::Connecting
-                            | QueuePhase::Sending
-                            | QueuePhase::Waiting
-                            | QueuePhase::Backoff
-                    );
+                    if close_flag.load(Ordering::Acquire) {
+                        return true;
+                    }
+                    let active = view.read(app).has_active_work();
                     #[cfg(target_os = "windows")]
                     if tray_available && let Some(native_window) = native_window {
-                        if gpui_platform::tray_exit_requested() {
-                            if active && !gpui_platform::confirm_exit_while_running() {
-                                gpui_platform::cancel_tray_exit();
-                                gpui_platform::show_window_from_tray(native_window);
-                                return false;
-                            }
+                        if !gpui_platform::tray_exit_requested() {
+                            gpui_platform::hide_window_to_tray(native_window);
+                            return false;
+                        }
+                        if !active {
                             close_flag.store(true, Ordering::Release);
                             return true;
                         }
-                        gpui_platform::hide_window_to_tray(native_window);
-                        return false;
+                        gpui_platform::cancel_tray_exit();
+                        gpui_platform::show_window_from_tray(native_window);
                     }
-                    let should_close = !active || gpui_platform::confirm_exit_while_running();
-                    if should_close {
+                    if !active {
                         close_flag.store(true, Ordering::Release);
+                        return true;
                     }
-                    should_close
+                    view.update(app, |view, cx| {
+                        view.exit_confirm_open = true;
+                        cx.notify();
+                    });
+                    false
                 });
             });
             let watcher_closing = Arc::clone(&closing);
@@ -3144,12 +3807,13 @@ pub fn run(
                 if watcher_closing.load(Ordering::Acquire) {
                     return;
                 }
-                if window.update(cx, |_, _, _| {}).is_ok() {
-                    gpui_platform::show_error_dialog(
-                        "Longwatch 后台已停止",
-                        "后台任务异常结束，请重新启动 Longwatch。详细原因已写入日志目录。",
-                    );
-                }
+                // The runtime ended on its own; say so inside the window.
+                let _ = window.update(cx, |_root, _window, cx| {
+                    queue_view_for_snapshots.update(cx, |view, cx| {
+                        view.runtime_stopped = true;
+                        cx.notify();
+                    });
+                });
             })
             .detach();
         });
@@ -3174,90 +3838,131 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+
     use super::*;
 
-    #[test]
-    fn retry_error_is_kept_in_the_conversation_and_simplified_on_the_left() {
-        let error = "stream disconnected before completion: error sending request for url (https://anyrouter.top/v1/responses)";
-        let snapshot = QueueSnapshot {
-            phase: QueuePhase::Backoff,
-            status_message: format!("{error}；已安排低频重试"),
-            reply_preview: error.into(),
-            ..QueueSnapshot::default()
-        };
-
-        assert_eq!(conversation_text(&snapshot), error);
-        assert_eq!(simple_status_title(&snapshot), "等待下一次重试");
-    }
-
-    #[test]
-    fn internal_retry_status_moves_to_the_codex_message_when_no_preview_exists() {
-        let status = "Codex 正在内部重试：Reconnecting... 2/5";
-        let snapshot = QueueSnapshot {
-            phase: QueuePhase::Waiting,
-            status_message: status.into(),
-            ..QueueSnapshot::default()
-        };
-
-        assert_eq!(conversation_text(&snapshot), status);
-        assert_eq!(simple_status_title(&snapshot), "Codex 正在自动重试");
-    }
-
-    #[test]
-    fn status_icons_use_distinct_literal_metaphors() {
-        let phases = [
-            (QueuePhase::Idle, IconName::Play),
-            (QueuePhase::Connecting, IconName::Link),
-            (QueuePhase::Sending, IconName::SendFilled),
-            (QueuePhase::Waiting, IconName::Loading),
-            (QueuePhase::Backoff, IconName::HourglassFilled),
-            (QueuePhase::Success, IconName::CheckCircleFilled),
-            (QueuePhase::Paused, IconName::Pause),
-            (QueuePhase::FatalError, IconName::ErrorCircleFilled),
-        ];
-
-        for (phase, icon) in phases {
-            let snapshot = QueueSnapshot {
-                phase,
-                ..QueueSnapshot::default()
-            };
-            assert_eq!(status_icon_name(&snapshot), icon);
+    fn summary(phase: QueuePhase) -> QueueSessionSummary {
+        QueueSessionSummary {
+            id: 7,
+            phase,
+            has_history: true,
+            active: phase.is_running(),
+            ..QueueSessionSummary::default()
         }
+    }
 
-        let retrying = QueueSnapshot {
-            phase: QueuePhase::Waiting,
-            status_message: "Reconnecting... 1/5".into(),
+    #[test]
+    fn backoff_rows_show_a_live_countdown_and_attempts() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 6, 0, 0).unwrap();
+        let mut session = summary(QueuePhase::Backoff);
+        session.next_attempt_at = Some(now + chrono::Duration::seconds(42));
+        session.attempt_count = 3;
+
+        assert_eq!(session_meta(&session, now), "42 秒后重试 · 已尝试 3 次");
+        session.next_attempt_at = Some(now + chrono::Duration::seconds(190));
+        assert_eq!(session_meta(&session, now), "3 分钟后重试 · 已尝试 3 次");
+        session.next_attempt_at = Some(now - chrono::Duration::seconds(1));
+        assert_eq!(session_meta(&session, now), "即将重试 · 已尝试 3 次");
+    }
+
+    #[test]
+    fn running_rows_show_how_long_the_task_has_been_queued() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 6, 0, 0).unwrap();
+        let mut session = summary(QueuePhase::Waiting);
+        session.first_attempt_at = Some(now - chrono::Duration::seconds(30));
+        assert_eq!(session_meta(&session, now), "处理中");
+
+        session.first_attempt_at = Some(now - chrono::Duration::minutes(75));
+        assert_eq!(session_meta(&session, now), "处理中 · 1 小时 15 分");
+
+        session.status_message = "Codex 正在内部重试：Reconnecting... 2/5".into();
+        assert_eq!(session_state_label(&session), "自动重试中");
+    }
+
+    #[test]
+    fn finished_and_stopped_tasks_are_grouped_apart_from_running_ones() {
+        let snapshot = QueueSnapshot {
+            sessions: vec![
+                QueueSessionSummary {
+                    id: 1,
+                    ..summary(QueuePhase::Waiting)
+                },
+                QueueSessionSummary {
+                    id: 2,
+                    ..summary(QueuePhase::Success)
+                },
+                QueueSessionSummary {
+                    id: 3,
+                    ..summary(QueuePhase::Paused)
+                },
+                QueueSessionSummary {
+                    id: 4,
+                    has_history: false,
+                    ..summary(QueuePhase::Idle)
+                },
+                QueueSessionSummary {
+                    id: 5,
+                    ..summary(QueuePhase::Idle)
+                },
+            ],
+            pending_tasks: vec![PendingTaskSummary {
+                id: 9,
+                title: "later".into(),
+                ..PendingTaskSummary::default()
+            }],
             ..QueueSnapshot::default()
         };
-        assert_eq!(status_icon_name(&retrying), IconName::Refresh);
-    }
+        let lists = QueueLists::from_snapshot(&snapshot);
 
-    #[test]
-    fn near_retry_deadline_uses_a_second_level_countdown() {
-        let now = chrono::Utc::now();
-        let label = next_attempt_label_at(now + chrono::Duration::seconds(42), now);
-
-        assert!(label.starts_with("约 42 秒后"));
-        assert!(label.contains(':'));
-    }
-
-    #[test]
-    fn minute_scale_retry_deadline_is_rounded_for_readability() {
-        let now = chrono::Utc::now();
-        let label = next_attempt_label_at(now + chrono::Duration::seconds(190), now);
-
-        assert!(label.starts_with("约 3 分钟后"));
-    }
-
-    #[test]
-    fn attempt_grid_lights_one_cell_at_a_time_across_each_row() {
-        assert_eq!(attempt_grid_index(0, 0), 0);
-        assert_eq!(attempt_grid_index(0, 1), 1);
+        assert_eq!(lists.running.iter().map(|s| s.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(lists.paused.iter().map(|s| s.id).collect::<Vec<_>>(), [3]);
         assert_eq!(
-            attempt_grid_index(0, ATTEMPT_GRID_COLUMNS - 1),
-            ATTEMPT_GRID_COLUMNS - 1
+            lists.finished.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [5, 2]
         );
-        assert_eq!(attempt_grid_index(1, 0), ATTEMPT_GRID_COLUMNS);
+        assert_eq!(lists.waiting.len(), 1);
+        assert_eq!(lists.waiting[0].0, 1);
+    }
+
+    #[test]
+    fn streamed_text_is_shown_but_error_notices_are_not() {
+        let mut snapshot = QueueSnapshot {
+            phase: QueuePhase::Waiting,
+            session_prompt: "write a poem".into(),
+            reply_preview: "Roses are".into(),
+            ..QueueSnapshot::default()
+        };
+        let entries = timeline_entries(&snapshot);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content, "write a poem");
+        assert_eq!(entries[1].content, "Roses are");
+
+        snapshot.reply_preview = "stream disconnected before completion".into();
+        snapshot.reply_preview_is_notice = true;
+        assert_eq!(timeline_entries(&snapshot).len(), 1);
+    }
+
+    #[test]
+    fn identity_description_names_the_upstream_originator() {
+        assert!(identity_description(ClientIdentity::OfficialDesktop).contains("Codex Desktop"));
+        assert!(identity_description(ClientIdentity::CodexCli).contains("codex_cli_rs"));
+    }
+
+    #[test]
+    fn long_labels_are_shortened_with_an_ellipsis() {
+        assert_eq!(ellipsize("short", 200., 12.), "short");
+        let shortened = ellipsize("一个很长很长很长很长很长的任务标题", 100., 12.);
+        assert!(shortened.ends_with('…'));
+        assert!(shortened.chars().count() < 18);
+    }
+
+    #[test]
+    fn phrases_are_split_on_bars_and_trimmed() {
+        assert_eq!(
+            parse_phrases(" busy | | Server overloaded; retry later. "),
+            ["busy", "Server overloaded; retry later."]
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 <p align="center"><strong>Stay with the task.</strong></p>
 
 <p align="center">
-  一个原生桌面守候工具，让同一条 Codex 任务在过载、断连、重启与漫长等待中继续前进，同时严格避免并发回合。
+  一个原生桌面守候工具，让 Codex 任务在过载、断连、重启与漫长等待中继续前进；默认串行，也可按需并行多个独立会话。
 </p>
 
 <p align="center">
@@ -24,18 +24,21 @@
 
 长时间运行的 Codex 任务偶尔会遇到容量繁忙、事件流断开，或者电脑休眠后中途停住。手动盯着重试很打断工作，机械地重复提交又可能造成同一任务重复执行，甚至并发修改同一份工程。
 
-Longwatch 接管的是“等待与恢复”这段工作。它只发送你填写的那一条真实任务，绑定一个持久 Codex 线程，根据最终结果决定成功、等待、重试或暂停，并在收到有效回复后提醒你。
+Longwatch 接管的是“等待与恢复”这段工作。每个任务都使用一个持久 Codex 线程，根据最终结果决定成功、等待、重试或暂停，并在收到有效回复后提醒你。默认并发数为 1；需要更高吞吐量时，可让多个互不混用的会话同时运行。
 
-它不会生成凑数提示词，不会切换账号，不会绕过限制，也不会同时开启多个回合。
+它不会生成凑数提示词，不会切换账号，也不会绕过限制。同一会话内始终只有一个活动回合；只有用户明确提高并发数并创建新会话时，不同会话才会并行。
 
 ## 核心能力
 
 - **一个持久线程，一个活动回合。** 确定性的状态机从结构上阻止重叠请求。
+- **可选的多会话并行。** 默认单会话；设置中可调整为 1–8 个独立会话，满载后的新任务进入 FIFO 等待队列，空出槽位后自动补位。
 - **崩溃后安全对账。** 在 `turn/start` 前先持久化“不确定提交”标记；重启后先恢复线程并向 Codex 核对真实状态，再决定是否允许下一次发送。
 - **优先使用正式协议。** 默认启动 `codex app-server --listen stdio://`，通过按行分隔的 JSON-RPC 通信。
+- **与官方应用相同的请求。** 默认以 ChatGPT 桌面应用的身份连接 app-server，上游请求携带 `originator: Codex Desktop` 与相同的 User-Agent；也可在设置中切换为 Codex CLI 身份或 Longwatch 自己的身份。
 - **克制的重试节奏。** 普通瞬时故障默认从 30 秒起步，1.7 倍增长，10 分钟封顶，带 ±15% 抖动，并保留 15 秒硬下限。
 - **理解 Codex 的不同结果。** 容量繁忙、HTTP 瞬时错误、内部重试、空回复、断流、鉴权失败与策略拒绝不会被一概而论。
 - **休眠唤醒保护。** 系统恢复后至少再等 60 秒，不会把错过的重试一次性补发。
+- **以排队为中心的工作台。** 参照 Qoder 设计：侧栏就是队列（进行中、带倒计时的等待重试、按顺位排队、已完成），右侧显示选中任务的对话；其它选项都放在独立的设置页。
 - **原生桌面体验。** GPUI 界面、系统通知、Windows 托盘、结果打开、诊断与崩溃报告。
 - **跨平台发布。** GitHub Actions 自动构建 Windows 安装程序与便携 ZIP、Linux DEB/AppImage/tar.gz，以及面向 Intel 和 Apple Silicon 的 macOS DMG 与便携应用包。
 - **macOS 主题图标。** 应用运行时随系统浅色/深色模式切换白底深标与黑底白标 Dock 图标。
@@ -61,14 +64,20 @@ Idle
 Longwatch 默认启动本地 Codex CLI 的 app-server，并通过 stdio 交换按行分隔的 JSON-RPC：
 
 ```text
-initialize
-thread/start 或 thread/resume
-turn/start
+initialize                       clientInfo + capabilities，与桌面应用一致
+thread/start                     threadSource "user"
+thread/resume                    excludeTurns + initialTurnsPage（只取最近一个回合）
+turn/start                       文本输入，附带 clientUserMessageId
 item/agentMessage/delta          流式预览
 item/completed                   权威消息项
 turn/completed                   最终判定点
+thread/items/list                断线期间错过最终回复时回读
 turn/interrupt                   暂停、停止或超时中断
 ```
+
+“请求身份”决定上游服务看到的客户端。默认的**官方桌面版**会在 `initialize` 中发送 `clientInfo { name: "codex_desktop", title: "Codex Desktop" }`，并像 ChatGPT 桌面应用一样以 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=Codex Desktop` 启动 app-server；**官方 CLI** 使用 `codex_cli_rs`，**Longwatch** 使用 `codex-longwatch`。
+
+需要人工处理的服务端请求（执行命令或修改文件的审批、额外权限、工具补充信息、MCP 表单）会收到与官方客户端相同的“拒绝”答复。Longwatch 从不替你批准任何操作；Codex 会把它当作一次普通的拒绝并继续工作。
 
 协议载荷使用宽容的 `serde_json::Value` 解码，不强依赖每个可选字段，降低相邻 Codex CLI 版本变化带来的兼容风险。
 
@@ -80,10 +89,10 @@ Longwatch 用一套很小的预写式恢复协议解决它：
 
 1. 在本地记录本轮尝试。
 2. 原子保存 `submissionUncertain = true`。
-3. 保存成功后才允许调用 `turn/start`。
+3. 保存成功后才允许调用 `turn/start`，并附带一个随标记一起保存的新 `clientUserMessageId`。
 4. 收到回合 ID 或完成线程对账后清除标记。
 5. 重启后先执行 `thread/resume`，禁止直接补发。
-6. Codex 若报告正在进行或已经完成的回合，就以服务端状态为准。
+6. 最近回合带着我们的 `clientUserMessageId` 时，以服务端状态为准；如果带的是别的 ID，说明上次请求根本没有到达，就重新发送，而不会把更早的回答误当成这次的结果。
 7. 如果依然无法证明上次是否提交成功，则进入普通退避，而不是马上制造重复请求。
 
 如果关键状态无法落盘，Longwatch 会在越过进程边界前暂停。
@@ -93,7 +102,7 @@ Longwatch 用一套很小的预写式恢复协议解决它：
 | 结果 | 处理方式 |
 | --- | --- |
 | `willRetry = true` | 当前回合仍归 Codex 所有，不额外发送 |
-| 当前高需求固定提示 | 静默立即衔接，不触发红色重试提醒 |
+| 当前高需求固定提示 | 按 10 秒固定节奏重新排队，不触发红色重试提醒 |
 | Codex 内部重试次数耗尽 | 短暂稳定后开始下一轮外部尝试 |
 | 429 / 502 / 503 / 504、过载文本、进程或事件流瞬断 | 进入克制的自动重试 |
 | 成功状态但回复为空 | 在配置上限内继续重试 |
@@ -105,6 +114,14 @@ Longwatch 用一套很小的预写式恢复协议解决它：
 ```text
 delay(n) = min(30 秒 × 1.7^(n-1), 10 分钟) × random(0.85 … 1.15)
 ```
+
+“当前高需求”提示走另一条固定节奏，模仿有人在看到报错后手动再点一次发送：
+
+```text
+delay = 10 秒 × random(0.8 … 1.2)
+```
+
+Codex 自己的容量重试是 5 次内部重连（约每 10–12 秒一次），外层排队使用同样的频率，因此在 Codex 内部重试耗尽后大约每 10 秒重新排一次队，不会形成 0 间隔的请求风暴。
 
 app-server 自身的连接恢复采用独立的 5 秒、15 秒、60 秒封顶序列。
 
@@ -124,10 +141,12 @@ Longwatch 使用操作系统标准配置目录，并通过临时文件加原子�
 GPUI / TDesign 桌面界面
         │ 命令 + 状态快照
         ▼
-QueueRuntime ── QueueMachine ── 结果分类 / 退避 / 唤醒检测
-        │
-        └── Codex app-server 传输层
-               └── stdio JSON-RPC + 持久线程对账
+MultiSessionRuntime ── 全局 FIFO 等待队列
+        │ 1–8 个独立槽位
+        ├── QueueRuntime ── QueueMachine ── 结果分类 / 退避 / 唤醒检测
+        │         └── Codex app-server 进程 ── 持久线程 1
+        └── QueueRuntime ── QueueMachine
+                  └── Codex app-server 进程 ── 持久线程 N
 
 平台门面：通知 · 托盘 · 打开结果 · 强提醒 · 诊断
 持久化：原子配置/状态 JSON · 按日日志 · 崩溃报告
@@ -135,7 +154,7 @@ QueueRuntime ── QueueMachine ── 结果分类 / 退避 / 唤醒检测
 
 | 文件 | 责任 |
 | --- | --- |
-| `src/runtime.rs` | 串行控制器、恢复协议、超时与持久化边界 |
+| `src/runtime.rs` | 多会话调度、单会话串行控制器、恢复协议、超时与持久化边界 |
 | `src/queue.rs` | 确定性状态机与单回合不变量 |
 | `src/app_server.rs` | Codex app-server 生命周期和 JSON-RPC |
 | `src/classifier.rs` | 成功、重试、暂停结果分类 |
@@ -147,7 +166,7 @@ QueueRuntime ── QueueMachine ── 结果分类 / 退避 / 唤醒检测
 ## 使用条件
 
 - Windows 10 1809 及以上、macOS 12 及以上，或较新的 Linux 桌面环境。
-- `PATH` 中存在可用的 `codex`，或者在高级设置中配置 Codex 可执行文件路径。
+- `PATH` 中存在可用的 `codex`，或者在 `config.json` 中设置 `codexPath`。
 - 已经完成 Codex 登录。Longwatch 不负责替你认证。
 
 ## 安装
@@ -181,21 +200,24 @@ Linux 还需要 Fontconfig、X11/XCB、Wayland、EGL 和 OpenGL 开发包，具�
 
 ## 使用方法
 
-1. 输入一条真实、完整的 Codex 任务。
-2. 按需选择工作目录。
-3. 按 `Ctrl+Enter` 或点击主按钮。
-4. 让 Longwatch 保持运行，它会维持单回合串行并处理可重试故障。
-5. 完成后从系统通知、主界面或 Windows 托盘打开结果。
+1. 点击侧栏的“新任务”（`Ctrl+N`），写下任务，需要时在输入框下方选择工作目录。
+2. 按 `Enter` 加入队列（`Shift+Enter` 换行）。有空闲通道时立即开始，否则按提交顺序进入“排队中”。
+3. 侧栏实时显示每个任务的状态：处理中、等待重试（带倒计时）、排队顺位、已暂停或已完成。
+4. 选中任务即可查看对话。在这里输入会继续同一个 Codex 会话；任务仍在运行时，消息会在当前回合结束后自动发送。
+5. 任务标题栏提供“暂停”“停止”“在 Codex 中打开”“移除”；等待重试的任务还可以“立即重试”。
 
-高级设置中的“启动默认消息”会在每次全新启动时填入主输入框，可按需修改；打开“启动后发送”并保留默认消息后，Longwatch 会在启动时自动提交一次。软件保持打开时，连续发送会复用同一个 Codex 会话。
+其余选项都在“设置”中：同时运行的任务数（1–8）、触发重新排队的繁忙提示短语、启动时自动发送的消息、请求身份、完成提示音与诊断信息。
 
-任务运行期间，任务文本和重试参数会锁定；提醒选项可以实时修改。点击“暂停”会中断当前回合并保留可恢复状态；点击“停止”只停止当前回合并保留会话，下一条消息会继续当前会话。正常退出软件后，会话关联会被清除，下次启动从新会话开始。
+每个运行中的任务都会使用独立的 `codex app-server` 进程，因此会增加 CPU、内存和 Codex 服务请求压力。建议从 2 开始，根据机器性能和实际限额逐步调整；上限固定为 8。任务完成后会释放进程，继续追问时再重新连接并恢复同一个线程。
+
+“暂停”会中断当前回合并保留可恢复状态，“继续”会以“从中断处继续”的消息接着做；“停止”结束当前回合并保留会话，下一条消息会继续当前会话。退出 Longwatch 会停止所有进行中和排队中的任务；Windows 托盘可用时，关闭窗口只会隐藏到托盘。
 
 ## 隐私与安全边界
 
 - Longwatch 完全在本机运行，只与本机安装的 Codex CLI 通信。
 - 它继承现有 `CODEX_HOME`、供应商设置与 Codex 登录状态。
 - 它不读取、不索取、也不保存 API key。
+- 默认以官方桌面应用的身份发出请求；如果希望请求标明来自 Longwatch，可在“设置 → 请求身份”中选择 Longwatch。
 - 项目不包含 WebView、Node 运行时、本地 HTTP 服务、远程控制服务、遥测客户端或账号切换器。
 - 一键复制的支持报告会排除任务原文、配置文件、环境变量和凭据，但可能包含应用/系统版本、队列元数据、线程 ID、有限长度的回复/错误预览与近期 Longwatch 日志。
 
@@ -205,11 +227,11 @@ Linux 还需要 Fontconfig、X11/XCB、Wayland、EGL 和 OpenGL 开发包，具�
 
 ### Codex CLI 不可用
 
-先在正常终端中执行 `codex --version`，再确认高级设置中的可执行文件路径。Longwatch 继承启动它的进程环境。
+先在正常终端中执行 `codex --version`，再查看“设置 → Codex 程序”。需要换用其它可执行文件时，在 `config.json` 中设置 `codexPath`。Longwatch 继承启动它的进程环境。
 
 ### 一直显示正在重连
 
-从高级设置打开日志目录，查看最新的 `longwatch.log.*`。其中包含 app-server stderr 与连接、重试时间线。
+在“设置 → 诊断信息 → 打开日志”中查看最新的 `longwatch.log.*`。其中包含 app-server stderr 与连接、重试时间线。
 
 ### 状态保存失败
 

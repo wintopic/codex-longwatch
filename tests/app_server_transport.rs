@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use codex_longwatch::{
     app_server::AppServerTransport,
-    config::{PersistedQueueState, QueueConfig},
+    config::{ClientIdentity, PersistedQueueState, QueueConfig},
     queue::QueuePhase,
     runtime::{RuntimeCommand, spawn_runtime},
     transport::{CodexTransport, TransportEvent, TransportKind, TurnStatus},
@@ -33,7 +33,7 @@ async fn completed_item_supplies_the_final_reply_when_turn_items_are_empty() {
     transport.connect().await.unwrap();
     let thread = transport.start_thread(None).await.unwrap();
     let turn = transport
-        .start_turn(&thread.id, "real task", None)
+        .start_turn(&thread.id, "real task", None, "client-message")
         .await
         .unwrap();
 
@@ -65,7 +65,7 @@ async fn the_same_transport_can_reconnect_with_fresh_rpc_state() {
     transport.connect().await.unwrap();
     let second_thread = transport.start_thread(None).await.unwrap();
     let turn = transport
-        .start_turn(&second_thread.id, "real task", None)
+        .start_turn(&second_thread.id, "real task", None, "client-message")
         .await
         .unwrap();
 
@@ -109,12 +109,8 @@ async fn completed_item_stops_the_runtime_without_scheduling_an_empty_reply_retr
     assert_eq!(snapshot.attempt_count, 1);
     assert_eq!(snapshot.reply_preview, "final from item");
     assert!(snapshot.reply_completed_at.is_some());
-    assert!(snapshot.transport_status.connected);
-    assert_eq!(snapshot.transport_status.kind, TransportKind::AppServer);
-    assert_eq!(
-        snapshot.transport_status.server_agent.as_deref(),
-        Some("fake-codex/1")
-    );
+    // A finished task releases its app-server; a follow-up reconnects.
+    assert!(!snapshot.transport_status.connected);
     runtime.send(RuntimeCommand::Shutdown).await.unwrap();
     runtime.join().await.unwrap();
 }
@@ -126,7 +122,7 @@ async fn two_high_demand_turns_then_success() {
     let thread = transport.start_thread(None).await.unwrap();
     for attempt in 1..=3 {
         let turn = transport
-            .start_turn(&thread.id, "real task", None)
+            .start_turn(&thread.id, "real task", None, "client-message")
             .await
             .unwrap();
         let final_message = completed(&mut transport, &turn.id).await;
@@ -145,7 +141,7 @@ async fn internal_retry_stays_on_the_same_turn() {
     transport.connect().await.unwrap();
     let thread = transport.start_thread(None).await.unwrap();
     let turn = transport
-        .start_turn(&thread.id, "real task", None)
+        .start_turn(&thread.id, "real task", None, "client-message")
         .await
         .unwrap();
     let mut saw_internal_retry = false;
@@ -181,7 +177,7 @@ async fn fatal_error_is_returned_on_completion() {
     transport.connect().await.unwrap();
     let thread = transport.start_thread(None).await.unwrap();
     let turn = transport
-        .start_turn(&thread.id, "real task", None)
+        .start_turn(&thread.id, "real task", None, "client-message")
         .await
         .unwrap();
     loop {
@@ -209,7 +205,7 @@ async fn process_crash_can_be_reconciled_by_thread_resume() {
     first.connect().await.unwrap();
     let thread = first.start_thread(None).await.unwrap();
     first
-        .start_turn(&thread.id, "real task", None)
+        .start_turn(&thread.id, "real task", None, "client-message")
         .await
         .unwrap();
     loop {
@@ -241,7 +237,7 @@ async fn timeout_is_followed_by_an_interrupt_request() {
     transport.connect().await.unwrap();
     let thread = transport.start_thread(None).await.unwrap();
     let turn = transport
-        .start_turn(&thread.id, "real task", None)
+        .start_turn(&thread.id, "real task", None, "client-message")
         .await
         .unwrap();
     let completion = tokio::time::timeout(std::time::Duration::from_millis(100), async {
@@ -273,13 +269,13 @@ async fn late_completion_keeps_the_old_turn_id() {
     transport.connect().await.unwrap();
     let thread = transport.start_thread(None).await.unwrap();
     let first = transport
-        .start_turn(&thread.id, "real task", None)
+        .start_turn(&thread.id, "real task", None, "client-message")
         .await
         .unwrap();
     assert_eq!(completed(&mut transport, &first.id).await, "first response");
 
     let second = transport
-        .start_turn(&thread.id, "real task", None)
+        .start_turn(&thread.id, "real task", None, "client-message")
         .await
         .unwrap();
     let mut late = None;
@@ -328,6 +324,41 @@ async fn server_request_with_string_id_is_explicitly_rejected() {
         .await
         .unwrap();
     assert_eq!(response["id"], "approval-request");
-    assert_eq!(response["error"]["code"], -32601);
+    // Declined exactly like the official clients' "decline" button; nothing
+    // is ever approved on the user's behalf.
+    assert_eq!(response["result"]["decision"], "decline");
+    assert!(response.get("error").is_none());
+    transport.shutdown().await;
+}
+
+#[tokio::test]
+async fn handshake_matches_the_official_desktop_client() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("initialize.json");
+    let mut transport = fake_transport("success")
+        .with_client_identity(ClientIdentity::OfficialDesktop)
+        .with_env("LONGWATCH_FAKE_INIT_LOG", log.as_os_str());
+    transport.connect().await.unwrap();
+
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&log).unwrap()).unwrap();
+    assert_eq!(record["params"]["clientInfo"]["name"], "codex_desktop");
+    assert_eq!(record["params"]["clientInfo"]["title"], "Codex Desktop");
+    assert_eq!(record["params"]["capabilities"]["experimentalApi"], true);
+    assert_eq!(record["originatorOverride"], "Codex Desktop");
+    transport.shutdown().await;
+}
+
+#[tokio::test]
+async fn non_desktop_identities_drop_an_inherited_originator_override() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("initialize.json");
+    let mut transport = fake_transport("success")
+        .with_client_identity(ClientIdentity::CodexCli)
+        .with_env("LONGWATCH_FAKE_INIT_LOG", log.as_os_str());
+    transport.connect().await.unwrap();
+
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&log).unwrap()).unwrap();
+    assert_eq!(record["params"]["clientInfo"]["name"], "codex_cli_rs");
+    assert!(record["originatorOverride"].is_null());
     transport.shutdown().await;
 }
