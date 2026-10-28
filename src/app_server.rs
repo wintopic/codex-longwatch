@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -28,6 +29,7 @@ use tracing::{debug, warn};
 
 use crate::{
     classifier::TurnError,
+    config::ClientIdentity,
     transport::{
         CodexTransport, RestoredTurn, StartedTurn, ThreadSession, TransportError, TransportEvent,
         TransportKind, TransportStatus, TurnStatus,
@@ -35,9 +37,66 @@ use crate::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
-const CLIENT_NAME: &str = "codex-longwatch";
+/// Read by `codex app-server` and preferred over `clientInfo.name` for the
+/// upstream `originator` header. The official desktop app sets it to
+/// `Codex Desktop` for every app-server it starts.
+const ORIGINATOR_OVERRIDE_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
+/// `thread/start` source used by the official clients for user threads.
+const THREAD_SOURCE: &str = "user";
+/// High-volume notifications Longwatch never reads. Opting out keeps reasoning,
+/// command output and diff streams off the stdio pipe, as the official desktop
+/// app does for the ones it ignores.
+const IGNORED_NOTIFICATIONS: &[&str] = &[
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/textDelta",
+    "item/commandExecution/outputDelta",
+    "item/commandExecution/terminalInteraction",
+    "item/fileChange/outputDelta",
+    "item/fileChange/patchUpdated",
+    "item/plan/delta",
+    "item/mcpToolCall/progress",
+    "turn/diff/updated",
+    "turn/plan/updated",
+    "thread/tokenUsage/updated",
+    "account/rateLimits/updated",
+    "mcpServer/startupStatus/updated",
+    "command/exec/outputDelta",
+    "process/outputDelta",
+    "fs/changed",
+];
+/// JSON-RPC codes the app-server uses for requests it cannot route.
+const UNSUPPORTED_REQUEST_CODES: [i64; 2] = [-32600, -32601];
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The wire form of a [`ClientIdentity`]: `clientInfo` for `initialize` and
+/// the originator override for the child environment.
+struct WireIdentity {
+    name: &'static str,
+    title: Option<&'static str>,
+    originator_override: Option<&'static str>,
+}
+
+const fn wire_identity(identity: ClientIdentity) -> WireIdentity {
+    match identity {
+        ClientIdentity::OfficialDesktop => WireIdentity {
+            name: "codex_desktop",
+            title: Some("Codex Desktop"),
+            originator_override: Some("Codex Desktop"),
+        },
+        ClientIdentity::CodexCli => WireIdentity {
+            name: "codex_cli_rs",
+            title: None,
+            originator_override: None,
+        },
+        ClientIdentity::Longwatch => WireIdentity {
+            name: "codex-longwatch",
+            title: Some("Longwatch"),
+            originator_override: None,
+        },
+    }
+}
 
 type PendingMap = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Value, TransportError>>>>>;
 type SharedWriter = Arc<Mutex<Option<ChildStdin>>>;
@@ -47,6 +106,7 @@ type CompletedMessages = Arc<Mutex<HashMap<(String, String), CompletedAgentMessa
 struct CompletedAgentMessage {
     text: String,
     explicit_final: bool,
+    completed_at: Option<DateTime<Utc>>,
 }
 
 /// JSON-RPC request identifiers are either strings or signed integers. We
@@ -88,6 +148,7 @@ pub struct AppServerTransport {
     connected: bool,
     server_agent: Option<String>,
     hide_window: bool,
+    identity: ClientIdentity,
     environment: Vec<(OsString, OsString)>,
     completed_messages: CompletedMessages,
 }
@@ -117,6 +178,7 @@ impl AppServerTransport {
             connected: false,
             server_agent: None,
             hide_window: false,
+            identity: ClientIdentity::default(),
             environment: Vec::new(),
             completed_messages: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -125,6 +187,12 @@ impl AppServerTransport {
     #[must_use]
     pub fn with_hidden_window(mut self, hidden: bool) -> Self {
         self.hide_window = hidden;
+        self
+    }
+
+    #[must_use]
+    pub fn with_client_identity(mut self, identity: ClientIdentity) -> Self {
+        self.identity = identity;
         self
     }
 
@@ -263,6 +331,7 @@ impl AppServerTransport {
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) if !line.trim().is_empty() => {
+                        let line = strip_ansi(&line);
                         warn!(target: "app_server_stderr", message = %line, "Codex app-server stderr");
                     }
                     Ok(Some(_)) => {}
@@ -312,12 +381,58 @@ impl AppServerTransport {
         self.send_line(&json!({"method": "initialized", "params": {}}))
             .await
     }
+
+    /// Latest turn of a thread with full items, for servers whose
+    /// `thread/resume` response did not carry `initialTurnsPage`.
+    async fn read_latest_turn(&self, thread_id: &str) -> Option<RestoredTurn> {
+        match self
+            .request(
+                "thread/turns/list",
+                json!({
+                    "threadId": thread_id,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "full"
+                }),
+            )
+            .await
+        {
+            Ok(response) => response
+                .get("data")?
+                .as_array()?
+                .first()
+                .and_then(|turn| parse_turn(turn).ok()),
+            Err(error) if is_unsupported_request(&error) => {
+                let response = self
+                    .request(
+                        "thread/read",
+                        json!({"threadId": thread_id, "includeTurns": true}),
+                    )
+                    .await
+                    .ok()?;
+                response
+                    .get("thread")?
+                    .get("turns")?
+                    .as_array()?
+                    .last()
+                    .and_then(|turn| parse_turn(turn).ok())
+            }
+            Err(error) => {
+                debug!(%error, "无法读取线程的最近回合");
+                None
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl CodexTransport for AppServerTransport {
     fn set_app_server_window_hidden(&mut self, hidden: bool) {
         self.hide_window = hidden;
+    }
+
+    fn set_client_identity(&mut self, identity: ClientIdentity) {
+        self.identity = identity;
     }
 
     fn status(&self) -> TransportStatus {
@@ -354,6 +469,17 @@ impl CodexTransport for AppServerTransport {
         }
         // Keep the parent environment intact so the official CLI can resolve
         // the user's existing CODEX_HOME, login state, and provider config.
+        // Only the originator override is owned by the identity setting, so
+        // an inherited value (e.g. when launched from the desktop app's
+        // terminal) cannot silently change who the requests claim to be.
+        match wire_identity(self.identity).originator_override {
+            Some(originator) => {
+                command.env(ORIGINATOR_OVERRIDE_ENV, originator);
+            }
+            None => {
+                command.env_remove(ORIGINATOR_OVERRIDE_ENV);
+            }
+        }
         command.envs(self.environment.iter().cloned());
         command.kill_on_drop(true);
         let mut child = command.spawn().map_err(|error| {
@@ -396,15 +522,7 @@ impl CodexTransport for AppServerTransport {
         self.connected = true;
 
         let initialize = self
-            .request(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": CLIENT_NAME,
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }),
-            )
+            .request("initialize", initialize_params(self.identity))
             .await;
         let initialize = match initialize {
             Ok(initialize) => initialize,
@@ -428,13 +546,9 @@ impl CodexTransport for AppServerTransport {
         if !self.connected {
             return Err(TransportError::NotConnected);
         }
-        let params = json!({
-            "cwd": cwd.map(|path| path.to_string_lossy().into_owned()),
-            "ephemeral": false,
-            "sessionStartSource": "startup",
-            "threadSource": "codex-longwatch"
-        });
-        let response = self.request("thread/start", params).await?;
+        let response = self
+            .request("thread/start", thread_start_params(cwd))
+            .await?;
         parse_thread_session(&response)
     }
 
@@ -446,12 +560,19 @@ impl CodexTransport for AppServerTransport {
         if !self.connected {
             return Err(TransportError::NotConnected);
         }
-        let params = json!({
-            "threadId": thread_id,
-            "cwd": cwd.map(|path| path.to_string_lossy().into_owned())
-        });
-        let response = self.request("thread/resume", params).await?;
-        parse_thread_session(&response)
+        let response = self
+            .request("thread/resume", thread_resume_params(thread_id, cwd))
+            .await?;
+        let mut session = parse_thread_session(&response)?;
+        // Servers that predate `initialTurnsPage` may still honour
+        // `excludeTurns`; ask for the latest turn explicitly so a crash
+        // between `turn/start` and its response can be reconciled.
+        if session.latest_turn.is_none()
+            && response.get("initialTurnsPage").is_none_or(Value::is_null)
+        {
+            session.latest_turn = self.read_latest_turn(&session.id).await;
+        }
+        Ok(session)
     }
 
     async fn start_turn(
@@ -459,6 +580,7 @@ impl CodexTransport for AppServerTransport {
         thread_id: &str,
         prompt: &str,
         cwd: Option<&Path>,
+        client_message_id: &str,
     ) -> Result<StartedTurn, TransportError> {
         if !self.connected {
             return Err(TransportError::NotConnected);
@@ -466,11 +588,7 @@ impl CodexTransport for AppServerTransport {
         let response = self
             .request(
                 "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": prompt}],
-                    "cwd": cwd.map(|path| path.to_string_lossy().into_owned())
-                }),
+                turn_start_params(thread_id, prompt, cwd, client_message_id),
             )
             .await?;
         let turn_id = response
@@ -503,6 +621,69 @@ impl CodexTransport for AppServerTransport {
         self.events.as_mut()?.recv().await
     }
 
+    async fn fetch_turn_message(&mut self, thread_id: &str, turn_id: &str) -> Option<String> {
+        if !self.connected {
+            return None;
+        }
+        // The paginated item API reads one turn without hydrating the whole
+        // thread; full `thread/read` hydration is deprecated and only kept as
+        // a fallback for servers that predate `thread/items/list`.
+        let items = match self
+            .request(
+                "thread/items/list",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "sortDirection": "desc",
+                    "limit": 50
+                }),
+            )
+            .await
+        {
+            Ok(response) => {
+                let mut items = response
+                    .get("data")?
+                    .as_array()?
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .get("turnId")
+                            .and_then(Value::as_str)
+                            .is_none_or(|id| id == turn_id)
+                    })
+                    .filter_map(|entry| entry.get("item").cloned())
+                    .collect::<Vec<_>>();
+                items.reverse();
+                Value::Array(items)
+            }
+            Err(error) if is_unsupported_request(&error) => {
+                let response = self
+                    .request(
+                        "thread/read",
+                        json!({"threadId": thread_id, "includeTurns": true}),
+                    )
+                    .await
+                    .ok()?;
+                let turns = response.get("thread")?.get("turns")?.as_array()?;
+                turns
+                    .iter()
+                    .find(|turn| string_field(turn, "id").as_deref() == Some(turn_id))?
+                    .get("items")?
+                    .clone()
+            }
+            Err(error) => {
+                debug!(%error, "无法回读回合正文");
+                return None;
+            }
+        };
+        let text = extract_final_message(Some(&items));
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
     async fn shutdown(&mut self) {
         self.connected = false;
         self.server_agent = None;
@@ -531,6 +712,111 @@ fn resolve_codex_path(path: &Path) -> PathBuf {
     which::which(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// `initialize` exactly as the official clients send it: `clientInfo` with a
+/// title plus `capabilities`.
+fn initialize_params(identity: ClientIdentity) -> Value {
+    let wire = wire_identity(identity);
+    json!({
+        "clientInfo": {
+            "name": wire.name,
+            "title": wire.title,
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "capabilities": {
+            "experimentalApi": true,
+            "optOutNotificationMethods": IGNORED_NOTIFICATIONS
+        }
+    })
+}
+
+fn thread_start_params(cwd: Option<&Path>) -> Value {
+    let mut params = json!({"threadSource": THREAD_SOURCE});
+    if let Some(cwd) = cwd {
+        params["cwd"] = Value::from(cwd.to_string_lossy().into_owned());
+    }
+    params
+}
+
+/// Resume without the deprecated full-history hydration; the latest turn is
+/// requested as the first page instead.
+fn thread_resume_params(thread_id: &str, cwd: Option<&Path>) -> Value {
+    let mut params = json!({
+        "threadId": thread_id,
+        "excludeTurns": true,
+        "initialTurnsPage": {"limit": 1, "sortDirection": "desc", "itemsView": "full"}
+    });
+    if let Some(cwd) = cwd {
+        params["cwd"] = Value::from(cwd.to_string_lossy().into_owned());
+    }
+    params
+}
+
+fn turn_start_params(
+    thread_id: &str,
+    prompt: &str,
+    cwd: Option<&Path>,
+    client_message_id: &str,
+) -> Value {
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": prompt, "text_elements": []}],
+        "clientUserMessageId": client_message_id
+    });
+    if let Some(cwd) = cwd {
+        params["cwd"] = Value::from(cwd.to_string_lossy().into_owned());
+    }
+    params
+}
+
+/// The "decline" reply for every interactive request the app-server may send,
+/// plus a short label for the status line. Unknown requests get a JSON-RPC
+/// error so the server never waits on Longwatch.
+fn decline_server_request(id: &RequestId, method: &str) -> (Value, &'static str) {
+    let (result, label) = match method {
+        "item/commandExecution/requestApproval" => (json!({"decision": "decline"}), "执行命令审批"),
+        "item/fileChange/requestApproval" => (json!({"decision": "decline"}), "修改文件审批"),
+        "item/permissions/requestApproval" => {
+            (json!({"permissions": {}, "scope": "turn"}), "额外权限")
+        }
+        "execCommandApproval" | "applyPatchApproval" => (json!({"decision": "denied"}), "操作审批"),
+        "mcpServer/elicitation/request" => (json!({"action": "decline"}), "MCP 表单输入"),
+        "item/tool/requestUserInput" => (json!({"answers": {}}), "补充信息"),
+        _ => {
+            return (
+                json!({
+                    "id": id.to_value(),
+                    "error": {"code": -32601, "message": format!("Longwatch does not handle {method}")}
+                }),
+                "交互操作",
+            );
+        }
+    };
+    (json!({"id": id.to_value(), "result": result}), label)
+}
+
+fn is_unsupported_request(error: &TransportError) -> bool {
+    matches!(error, TransportError::Rpc { code, .. } if UNSUPPORTED_REQUEST_CODES.contains(code))
+}
+
+/// Codex colours its stderr logs; keep Longwatch's log file plain text.
+fn strip_ansi(line: &str) -> String {
+    let mut plain = String::with_capacity(line.len());
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' && characters.peek() == Some(&'[') {
+            characters.next();
+            for code in characters.by_ref() {
+                if code.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(character);
+        }
+    }
+    plain
+}
+
 async fn dispatch_message(
     message: Value,
     pending: &PendingMap,
@@ -544,22 +830,20 @@ async fn dispatch_message(
                 TransportError::Protocol("JSON-RPC id must be a string or integer".into())
             })?;
         if message.get("method").is_some() {
-            // App-server requests (approvals, user input, etc.) are never
-            // silently automated.  Return a JSON-RPC method-not-found error so
-            // the turn stops visibly instead of granting permissions.
+            // Nobody watches an unattended queue, so interactive server
+            // requests are answered with the same "decline" the official
+            // clients send. Nothing is ever approved, and the agent gets an
+            // ordinary "rejected by user" result instead of a protocol error.
             let method = message
                 .get("method")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            warn!(method, "已拒绝需要人工交互的 Codex 服务端请求");
+            let (response, label) = decline_server_request(&id, method);
+            warn!(method, "已自动拒绝需要人工处理的 Codex 请求");
             let _ = events.try_send(TransportEvent::Diagnostic {
                 message: format!(
-                    "Codex 请求了交互式操作（{method}），已自动拒绝；请改用无需审批的运行策略后重试"
+                    "Codex 请求了{label}，无人值守时已自动拒绝；如需放行请调整 Codex 审批策略"
                 ),
-            });
-            let response = json!({
-                "id": id.to_value(),
-                "error": {"code": -32601, "message": "Longwatch does not handle server requests"}
             });
             let mut guard = writer.lock().await;
             if let Some(stdin) = guard.as_mut() {
@@ -611,10 +895,13 @@ async fn dispatch_message(
                 .lock()
                 .await
                 .remove(&(thread_id.clone(), turn.id.clone()));
-            if turn.final_message.trim().is_empty()
-                && let Some(cached) = cached
-            {
-                turn.final_message = cached.text;
+            if let Some(cached) = cached {
+                if turn.final_message.trim().is_empty() {
+                    turn.final_message = cached.text;
+                }
+                // The final agent item is the most precise source. Fall back
+                // to the turn timestamp when older servers omit it.
+                turn.completed_at = cached.completed_at.or(turn.completed_at);
             }
         }
         if matches!(&event, TransportEvent::AgentMessageDelta { .. }) {
@@ -671,6 +958,10 @@ fn parse_completed_agent_message(
         CompletedAgentMessage {
             text: string_field(item, "text")?,
             explicit_final: phase == Some("final_answer"),
+            completed_at: params
+                .get("completedAtMs")
+                .and_then(Value::as_i64)
+                .and_then(DateTime::<Utc>::from_timestamp_millis),
         },
     ))
 }
@@ -703,6 +994,15 @@ fn parse_event(method: &str, params: &Value) -> Option<TransportEvent> {
             let turn = parse_turn(params.get("turn")?).ok()?;
             Some(TransportEvent::TurnCompleted { thread_id, turn })
         }
+        "thread/status/changed" => {
+            let status = params.get("status")?.get("type")?.as_str()?;
+            if status != "systemError" {
+                return None;
+            }
+            Some(TransportEvent::ThreadSystemError {
+                thread_id: string_field(params, "threadId")?,
+            })
+        }
         _ => None,
     }
 }
@@ -713,10 +1013,19 @@ fn parse_thread_session(value: &Value) -> Result<ThreadSession, TransportError> 
         .ok_or_else(|| TransportError::Protocol("thread response has no thread object".into()))?;
     let id = string_field(thread, "id")
         .ok_or_else(|| TransportError::Protocol("thread response has no thread.id".into()))?;
-    let latest_turn = thread
-        .get("turns")
+    // `thread/resume` answers with the requested first page (newest first);
+    // servers that ignore the paging request still embed `thread.turns`.
+    let latest_turn = value
+        .get("initialTurnsPage")
+        .and_then(|page| page.get("data"))
         .and_then(Value::as_array)
-        .and_then(|turns| turns.last())
+        .and_then(|turns| turns.first())
+        .or_else(|| {
+            thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .and_then(|turns| turns.last())
+        })
         .and_then(|turn| parse_turn(turn).ok());
     Ok(ThreadSession { id, latest_turn })
 }
@@ -724,30 +1033,57 @@ fn parse_thread_session(value: &Value) -> Result<ThreadSession, TransportError> 
 fn parse_turn(value: &Value) -> Result<RestoredTurn, TransportError> {
     let id = string_field(value, "id")
         .ok_or_else(|| TransportError::Protocol("turn payload has no id".into()))?;
-    let status = match string_field(value, "status")
-        .ok_or_else(|| TransportError::Protocol("turn payload has no status".into()))?
-        .as_str()
-    {
+    let raw_status = string_field(value, "status")
+        .ok_or_else(|| TransportError::Protocol("turn payload has no status".into()))?;
+    // 未知状态不能直接丢弃整个 turn/completed：那会让运行时一直等到回合
+    // 超时。宁可把它当成一次可见的失败，让用户看到真实原因。
+    let mut unknown_status = None;
+    let status = match raw_status.as_str() {
         "completed" => TurnStatus::Completed,
         "interrupted" => TurnStatus::Interrupted,
         "failed" => TurnStatus::Failed,
         "inProgress" | "in_progress" => TurnStatus::InProgress,
         other => {
-            return Err(TransportError::Protocol(format!(
-                "unknown turn status {other}"
-            )));
+            unknown_status = Some(other.to_owned());
+            TurnStatus::Failed
         }
     };
     let error = value
         .get("error")
         .filter(|error| !error.is_null())
-        .and_then(|error| serde_json::from_value::<TurnError>(error.clone()).ok());
+        .and_then(|error| serde_json::from_value::<TurnError>(error.clone()).ok())
+        .or_else(|| {
+            unknown_status.map(|status| TurnError {
+                message: format!("Codex 返回了未知的回合状态：{status}"),
+                additional_details: None,
+                codex_error_info: Some(Value::String("other".into())),
+            })
+        });
     let final_message = extract_final_message(value.get("items"));
+    let completed_at = value
+        .get("completedAt")
+        .and_then(Value::as_i64)
+        .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0));
+    let user_messages = value
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| string_field(item, "type").as_deref() == Some("userMessage"));
+    let client_ids_reported = user_messages
+        .clone()
+        .any(|item| item.get("clientId").is_some());
+    let client_message_ids = user_messages
+        .filter_map(|item| string_field(item, "clientId"))
+        .collect();
     Ok(RestoredTurn {
         id,
         status,
         final_message,
         error,
+        completed_at,
+        client_message_ids,
+        client_ids_reported,
     })
 }
 
@@ -755,14 +1091,18 @@ fn extract_final_message(items: Option<&Value>) -> String {
     let Some(items) = items.and_then(Value::as_array) else {
         return String::new();
     };
-    items
-        .iter()
-        .rev()
-        .find_map(|item| {
+    let find_phase = |wanted: &str| {
+        items.iter().rev().find_map(|item| {
             (string_field(item, "type").as_deref() == Some("agentMessage")
-                && string_field(item, "phase").as_deref() == Some("final_answer"))
+                && string_field(item, "phase").as_deref() == Some(wanted))
             .then(|| string_field(item, "text").unwrap_or_default())
         })
+    };
+    // Codex 0.160+ 的 MessagePhase 变为 commentary / partial_answer /
+    // final_answer 三档。partial_answer 是"确定的答案但后面可能还有内容"，
+    // 只能作为 final_answer 缺失时的回退，不能和 commentary 混为一谈。
+    find_phase("final_answer")
+        .or_else(|| find_phase("partial_answer"))
         .or_else(|| {
             items.iter().rev().find_map(|item| {
                 (string_field(item, "type").as_deref() == Some("agentMessage")
@@ -786,6 +1126,7 @@ mod tests {
         let turn = json!({
             "id": "t1",
             "status": "completed",
+            "completedAt": 1_725_000_000,
             "items": [
                 {"type": "reasoning", "id": "r", "summary": []},
                 {"type": "agentMessage", "id": "a1", "text": "first"},
@@ -795,6 +1136,10 @@ mod tests {
         });
         let parsed = parse_turn(&turn).unwrap();
         assert_eq!(parsed.final_message, "final");
+        assert_eq!(
+            parsed.completed_at,
+            DateTime::<Utc>::from_timestamp(1_725_000_000, 0)
+        );
     }
 
     #[test]
@@ -802,6 +1147,7 @@ mod tests {
         let final_item = parse_completed_agent_message(&json!({
             "threadId": "th",
             "turnId": "tu",
+            "completedAtMs": 1_725_000_000_123_i64,
             "item": {
                 "id": "item-1",
                 "type": "agentMessage",
@@ -813,6 +1159,10 @@ mod tests {
         assert_eq!(final_item.0, ("th".into(), "tu".into()));
         assert_eq!(final_item.1.text, "final answer");
         assert!(final_item.1.explicit_final);
+        assert_eq!(
+            final_item.1.completed_at,
+            DateTime::<Utc>::from_timestamp_millis(1_725_000_000_123)
+        );
 
         assert!(
             parse_completed_agent_message(&json!({
@@ -878,6 +1228,160 @@ mod tests {
                 data: Some(_),
             } if message.contains("overloaded")
         ));
+    }
+
+    #[test]
+    fn official_desktop_identity_matches_the_desktop_handshake() {
+        let params = initialize_params(ClientIdentity::OfficialDesktop);
+
+        assert_eq!(params["clientInfo"]["name"], "codex_desktop");
+        assert_eq!(params["clientInfo"]["title"], "Codex Desktop");
+        assert_eq!(params["capabilities"]["experimentalApi"], true);
+        let opted_out = params["capabilities"]["optOutNotificationMethods"]
+            .as_array()
+            .unwrap();
+        assert!(opted_out.contains(&json!("turn/diff/updated")));
+        // Longwatch reads these, so they must never be suppressed.
+        for needed in [
+            "item/agentMessage/delta",
+            "item/completed",
+            "turn/started",
+            "turn/completed",
+            "error",
+            "thread/status/changed",
+        ] {
+            assert!(
+                !opted_out.contains(&json!(needed)),
+                "{needed} was opted out"
+            );
+        }
+        assert_eq!(
+            wire_identity(ClientIdentity::OfficialDesktop).originator_override,
+            Some("Codex Desktop")
+        );
+    }
+
+    #[test]
+    fn cli_and_longwatch_identities_never_claim_the_desktop_originator() {
+        assert_eq!(
+            initialize_params(ClientIdentity::CodexCli)["clientInfo"]["name"],
+            "codex_cli_rs"
+        );
+        assert_eq!(
+            initialize_params(ClientIdentity::Longwatch)["clientInfo"]["name"],
+            "codex-longwatch"
+        );
+        assert!(
+            wire_identity(ClientIdentity::CodexCli)
+                .originator_override
+                .is_none()
+        );
+        assert!(
+            wire_identity(ClientIdentity::Longwatch)
+                .originator_override
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn thread_and_turn_requests_use_the_official_shapes() {
+        assert_eq!(thread_start_params(None), json!({"threadSource": "user"}));
+        assert_eq!(
+            thread_start_params(Some(Path::new("C:/work")))["cwd"],
+            "C:/work"
+        );
+
+        let turn = turn_start_params("th", "do it", None, "client-1");
+        assert_eq!(
+            turn,
+            json!({
+                "threadId": "th",
+                "input": [{"type": "text", "text": "do it", "text_elements": []}],
+                "clientUserMessageId": "client-1"
+            })
+        );
+
+        let resume = thread_resume_params("th", None);
+        assert_eq!(resume["excludeTurns"], true);
+        assert_eq!(resume["initialTurnsPage"]["limit"], 1);
+        assert_eq!(resume["initialTurnsPage"]["sortDirection"], "desc");
+        assert_eq!(resume["initialTurnsPage"]["itemsView"], "full");
+    }
+
+    #[test]
+    fn resume_prefers_the_first_page_and_falls_back_to_embedded_turns() {
+        let paged = parse_thread_session(&json!({
+            "thread": {"id": "th", "turns": []},
+            "initialTurnsPage": {"data": [{
+                "id": "newest",
+                "status": "completed",
+                "items": [
+                    {"type": "userMessage", "id": "u", "clientId": "client-9", "content": []},
+                    {"type": "agentMessage", "id": "a", "text": "done", "phase": "final_answer"}
+                ]
+            }]}
+        }))
+        .unwrap();
+        let latest = paged.latest_turn.unwrap();
+        assert_eq!(latest.id, "newest");
+        assert_eq!(latest.client_message_ids, ["client-9"]);
+        assert!(latest.client_ids_reported);
+        assert_eq!(latest.final_message, "done");
+
+        let legacy = parse_thread_session(&json!({
+            "thread": {"id": "th", "turns": [
+                {"id": "old", "status": "completed", "items": []},
+                {"id": "last", "status": "interrupted", "items": [
+                    {"type": "userMessage", "id": "u", "content": []}
+                ]}
+            ]}
+        }))
+        .unwrap();
+        let latest = legacy.latest_turn.unwrap();
+        assert_eq!(latest.id, "last");
+        assert_eq!(latest.client_message_ids, Vec::<String>::new());
+        assert!(!latest.client_ids_reported);
+    }
+
+    #[test]
+    fn interactive_requests_are_declined_never_approved() {
+        let id = RequestId::String("req".into());
+        for (method, expected) in [
+            (
+                "item/commandExecution/requestApproval",
+                json!({"decision": "decline"}),
+            ),
+            (
+                "item/fileChange/requestApproval",
+                json!({"decision": "decline"}),
+            ),
+            ("execCommandApproval", json!({"decision": "denied"})),
+            (
+                "mcpServer/elicitation/request",
+                json!({"action": "decline"}),
+            ),
+            ("item/tool/requestUserInput", json!({"answers": {}})),
+            (
+                "item/permissions/requestApproval",
+                json!({"permissions": {}, "scope": "turn"}),
+            ),
+        ] {
+            let (response, _) = decline_server_request(&id, method);
+            assert_eq!(response["id"], "req");
+            assert_eq!(response["result"], expected, "{method}");
+        }
+        let (unknown, _) = decline_server_request(&RequestId::Number(4), "attestation/generate");
+        assert_eq!(unknown["id"], 4);
+        assert_eq!(unknown["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn stderr_colour_codes_are_removed() {
+        assert_eq!(
+            strip_ansi("\u{1b}[2m2026\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m failed"),
+            "2026 ERROR failed"
+        );
+        assert_eq!(strip_ansi("plain"), "plain");
     }
 
     #[cfg(windows)]

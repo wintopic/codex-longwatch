@@ -13,7 +13,7 @@ too_many_lines = "allow"
 
 [package]
 name = "codex-longwatch"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -39,9 +39,8 @@ path = "tests/support/fake_app_server.rs"
 required-features = ["test-support"]
 
 [features]
-default = ["desktop", "gui-fallback"]
+default = ["desktop"]
 desktop = []
-gui-fallback = ["gpui_platform/gui-fallback"]
 test-support = []
 
 [dependencies]
@@ -51,6 +50,7 @@ chrono = { version = "0.4.41", features = ["clock", "serde"] }
 directories = "6.0.0"
 futures = "0.3.31"
 gpui_platform = { path = "crates/gpui_platform", version = "=0.1.0" }
+gpui-component = { version = "0.5.1", default-features = false }
 tdesign-gpui = { git = "https://github.com/wintopic/TDesign-GPUI.git", rev = "ba209322beedd37d0696f5815e9a8755cfb33bf1", default-features = true }
 notify = "6.1.1"
 rand = "0.9.1"

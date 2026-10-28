@@ -7,6 +7,10 @@ use thiserror::Error;
 
 pub const ABSOLUTE_MIN_INTERVAL_SECS: u64 = 15;
 pub const MIN_WAKE_DELAY_SECS: u64 = 60;
+/// Codex 自己的容量重试大约每 10–12 秒一次（实测 5 次内部重连耗时约 58 秒）。
+/// 外层排队使用同样节奏，看起来就像有个人在看到报错后立刻又点了一次发送。
+pub const DEFAULT_HIGH_DEMAND_DELAY_SECS: u64 = 10;
+const MAX_HIGH_DEMAND_DELAY_SECS: u64 = 300;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
@@ -17,6 +21,8 @@ pub struct RetryPolicy {
     pub jitter_ratio: f64,
     pub max_empty_replies: u8,
     pub wake_delay_secs: u64,
+    /// 高需求 / 限流之后重新排队的固定间隔。
+    pub high_demand_delay_secs: u64,
 }
 
 impl Default for RetryPolicy {
@@ -28,6 +34,7 @@ impl Default for RetryPolicy {
             jitter_ratio: 0.15,
             max_empty_replies: 5,
             wake_delay_secs: MIN_WAKE_DELAY_SECS,
+            high_demand_delay_secs: DEFAULT_HIGH_DEMAND_DELAY_SECS,
         }
     }
 }
@@ -49,6 +56,11 @@ impl RetryPolicy {
         if self.wake_delay_secs < MIN_WAKE_DELAY_SECS {
             return Err(RetryPolicyError::WakeDelayTooShort);
         }
+        if !(1..=MAX_HIGH_DEMAND_DELAY_SECS).contains(&self.high_demand_delay_secs) {
+            return Err(RetryPolicyError::InvalidHighDemandDelay(
+                self.high_demand_delay_secs,
+            ));
+        }
         Ok(())
     }
 
@@ -61,6 +73,14 @@ impl RetryPolicy {
         let jittered = (raw * (1.0 + jitter)).round();
         let floor = ABSOLUTE_MIN_INTERVAL_SECS as f64;
         Duration::from_secs(jittered.max(floor) as u64)
+    }
+
+    /// 固定的"再排一次队"间隔，只做小幅抖动，避免和线上重试潮同步。
+    #[must_use]
+    pub fn high_demand_delay<R: Rng + ?Sized>(&self, rng: &mut R) -> Duration {
+        let base = self.high_demand_delay_secs.max(1) as f64;
+        let jitter = rng.random_range(-0.2_f64..=0.2_f64);
+        Duration::from_secs((base * (1.0 + jitter)).round().max(1.0) as u64)
     }
 
     #[must_use]
@@ -81,6 +101,8 @@ pub enum RetryPolicyError {
     InvalidJitter,
     #[error("系统唤醒后的等待时间不能少于 60 秒")]
     WakeDelayTooShort,
+    #[error("高需求重试间隔 {0} 秒必须在 1 到 300 秒之间")]
+    InvalidHighDemandDelay(u64),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,6 +113,11 @@ impl AttemptLedger {
     pub fn record(&mut self, now: DateTime<Utc>) {
         self.prune(now);
         self.0.push(now);
+    }
+
+    #[must_use]
+    pub fn first(&self) -> Option<DateTime<Utc>> {
+        self.0.first().copied()
     }
 
     fn prune(&mut self, now: DateTime<Utc>) {
@@ -148,6 +175,16 @@ mod tests {
 
         let far_future = policy.delay_for(99, &mut rng).as_secs();
         assert!((510..=690).contains(&far_future));
+    }
+
+    #[test]
+    fn high_demand_delay_matches_the_official_retry_cadence() {
+        let policy = RetryPolicy::default();
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        for _ in 0..20 {
+            let seconds = policy.high_demand_delay(&mut rng).as_secs();
+            assert!((8..=12).contains(&seconds), "unexpected delay {seconds}s");
+        }
     }
 
     #[test]

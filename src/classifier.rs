@@ -128,7 +128,15 @@ fn classify_error(error: &TurnError, failure_phrases: &[String]) -> TurnDecision
 
     if matches!(
         kind.as_deref(),
-        Some("serveroverloaded" | "internalservererror")
+        Some(
+            "serveroverloaded"
+                | "internalservererror"
+                // Codex 0.160+ 起把限流与 flex 容量不足单列成字符串变体，
+                // 不再附带 httpStatusCode。它们都是"等一会儿再来"的信号，
+                // 不能被当成致命错误直接暂停。
+                | "ratelimitexceeded"
+                | "flexunavailable"
+        )
     ) || normalized.contains("server overloaded")
         || error_contains_failure_phrase(&normalized, failure_phrases)
     {
@@ -439,6 +447,24 @@ mod tests {
             classify_error_notification(&textual_gateway_error, false, &phrases()),
             TurnDecision::Retryable(_)
         ));
+    }
+
+    #[test]
+    fn rate_limit_and_flex_unavailability_stay_retryable() {
+        for kind in ["rateLimitExceeded", "flexUnavailable"] {
+            let error = TurnError {
+                message: "try again later".into(),
+                codex_error_info: Some(serde_json::json!(kind)),
+                ..TurnError::default()
+            };
+            assert!(
+                matches!(
+                    classify_error_notification(&error, false, &phrases()),
+                    TurnDecision::Retryable(_)
+                ),
+                "{kind} should stay retryable"
+            );
+        }
     }
 
     #[test]

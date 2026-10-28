@@ -11,7 +11,7 @@
 //!
 //! GPUI 0.2.2 contains its windowing backends in the `gpui` crate.  This local
 //! facade intentionally owns the non-window services that vary by desktop OS:
-//! native notifications, thread opening, and explicitly opted-in GUI input.
+//! native notifications, thread opening, and platform-specific shell services.
 
 mod completion_alert;
 #[cfg(target_os = "windows")]
@@ -29,13 +29,10 @@ mod system_info;
 #[cfg(target_os = "windows")]
 mod tray;
 
-#[cfg(feature = "gui-fallback")]
-mod automation;
-
 pub use completion_alert::{
     show_completion_overlay, show_retry_error_overlay, stop_completion_overlay,
 };
-pub use error_dialog::{confirm_exit_while_running, show_error_dialog};
+pub use error_dialog::show_error_dialog;
 pub use identity::{IdentityError, initialize_app_identity};
 #[cfg(target_os = "macos")]
 pub use macos_icon::sync_macos_app_icon;
@@ -51,22 +48,3 @@ pub use tray::{
     request_existing_instance_show, set_tray_state, set_tray_tooltip, show_window_from_tray,
     shutdown_tray, take_tray_action, tray_exit_requested,
 };
-
-#[cfg(feature = "gui-fallback")]
-pub use automation::{AutomationError, GuiAutomation, SystemGuiAutomation};
-
-/// Returns true when the current Linux session is Wayland, including `XWayland`.
-#[must_use]
-pub fn is_wayland_session() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var_os("WAYLAND_DISPLAY").is_some()
-            || std::env::var("XDG_SESSION_TYPE")
-                .is_ok_and(|session| session.eq_ignore_ascii_case("wayland"))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
-}

@@ -7,7 +7,6 @@ description = "Platform services facade for Longwatch's GPUI desktop shell."
 
 [features]
 default = []
-gui-fallback = []
 
 [dependencies]
 thiserror = "2.0.12"
@@ -36,21 +35,14 @@ windows = { version = "0.61.1", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-accessibility = "0.2.0"
 arboard = { version = "3.6.1", default-features = false }
-core-foundation = "0.10.0"
-core-graphics = "0.24.0"
 mac-notification-sys = "0.6.15"
-macos-accessibility-client = "0.0.2"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage", "NSResponder"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
-async-io = "2.5.0"
-atspi = "0.30.0"
-enigo = { version = "0.6.1", default-features = false, features = ["x11rb"] }
 notify-rust = { version = "4.11.7", default-features = false, features = ["z"] }
 
 [lints]

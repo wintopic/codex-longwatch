@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::classifier::TurnError;
-pub use crate::gui_fallback::GuiFallbackTransport;
+use crate::{classifier::TurnError, config::ClientIdentity};
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -14,7 +14,6 @@ pub enum TransportKind {
     #[default]
     Disconnected,
     AppServer,
-    GuiFallback,
 }
 
 impl TransportKind {
@@ -23,7 +22,6 @@ impl TransportKind {
         match self {
             Self::Disconnected => "未连接",
             Self::AppServer => "Codex app-server",
-            Self::GuiFallback => "GUI 兼容回退",
         }
     }
 }
@@ -55,6 +53,17 @@ pub struct RestoredTurn {
     pub final_message: String,
     #[serde(default)]
     pub error: Option<TurnError>,
+    /// Authoritative completion timestamp supplied by Codex app-server.
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    /// `clientId` values of the user messages in this turn, i.e. the
+    /// `clientUserMessageId`s that started or steered it.
+    #[serde(default)]
+    pub client_message_ids: Vec<String>,
+    /// Whether the server reports `clientId` on user messages at all. Older
+    /// servers omit the field, so a missing id proves nothing there.
+    #[serde(default)]
+    pub client_ids_reported: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,11 +88,6 @@ pub enum TransportEvent {
         thread_id: String,
         turn_id: String,
     },
-    ThreadResolved {
-        previous_thread_id: String,
-        thread_id: String,
-        turn_id: String,
-    },
     Error {
         thread_id: String,
         turn_id: String,
@@ -93,6 +97,11 @@ pub enum TransportEvent {
     TurnCompleted {
         thread_id: String,
         turn: RestoredTurn,
+    },
+    /// Codex 0.160+ 新增的线程级状态通知。`systemError` 表示线程已经
+    /// 无法继续推进，此时既不会再有 turn 事件，也不会自动恢复。
+    ThreadSystemError {
+        thread_id: String,
     },
     Disconnected {
         message: String,
@@ -120,16 +129,16 @@ pub enum TransportError {
     Timeout(String),
     #[error("transport is not connected")]
     NotConnected,
-    #[error("GUI fallback is disabled: {0}")]
-    FallbackDisabled(String),
-    #[error("transport is unavailable: {0}")]
-    Unavailable(String),
 }
 
 #[async_trait]
+// async-trait marks the boxed futures it returns `#[must_use]`, which
+// clippy's `double_must_use` reports on every method.
+#[allow(clippy::double_must_use)]
 pub trait CodexTransport: Send {
-    fn set_gui_fallback_enabled(&mut self, _enabled: bool) {}
     fn set_app_server_window_hidden(&mut self, _hidden: bool) {}
+    /// Identity presented on the next `connect`.
+    fn set_client_identity(&mut self, _identity: ClientIdentity) {}
     fn status(&self) -> TransportStatus {
         TransportStatus::default()
     }
@@ -140,238 +149,28 @@ pub trait CodexTransport: Send {
         thread_id: &str,
         cwd: Option<&Path>,
     ) -> Result<ThreadSession, TransportError>;
+    /// `client_message_id` is sent as `clientUserMessageId`, exactly like the
+    /// official clients, so the turn can be recognised after a reconnect.
     async fn start_turn(
         &mut self,
         thread_id: &str,
         prompt: &str,
         cwd: Option<&Path>,
+        client_message_id: &str,
     ) -> Result<StartedTurn, TransportError>;
     async fn interrupt_turn(
         &mut self,
         thread_id: &str,
         turn_id: &str,
     ) -> Result<(), TransportError>;
+    /// 从持久化历史里回捞某个回合的最终助手文本。
+    ///
+    /// Codex 0.160+ 的 `turn/completed` 只带 `itemsView: "notLoaded"` 的空
+    /// items，流式阶段的 `item/completed` 才是正文来源。若客户端在断流后
+    /// 重连、缓存缺失，就必须回到 `thread/read` 才能拿到权威答案。
+    async fn fetch_turn_message(&mut self, _thread_id: &str, _turn_id: &str) -> Option<String> {
+        None
+    }
     async fn next_event(&mut self) -> Option<TransportEvent>;
     async fn shutdown(&mut self);
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ActiveTransport {
-    #[default]
-    None,
-    Primary,
-    Fallback,
-}
-
-/// Routes to the app-server first and consults the GUI fallback only after an
-/// explicit opt-in.  A primary connection failure can therefore never
-/// silently activate desktop automation.
-#[derive(Debug)]
-pub struct PreferredTransport<P, F> {
-    primary: P,
-    fallback: F,
-    fallback_enabled: bool,
-    active: ActiveTransport,
-}
-
-impl<P, F> PreferredTransport<P, F> {
-    #[must_use]
-    pub fn new(primary: P, fallback: F, fallback_enabled: bool) -> Self {
-        Self {
-            primary,
-            fallback,
-            fallback_enabled,
-            active: ActiveTransport::None,
-        }
-    }
-}
-
-#[async_trait]
-impl<P, F> CodexTransport for PreferredTransport<P, F>
-where
-    P: CodexTransport,
-    F: CodexTransport,
-{
-    fn set_gui_fallback_enabled(&mut self, enabled: bool) {
-        self.fallback_enabled = enabled;
-        self.fallback.set_gui_fallback_enabled(enabled);
-    }
-
-    fn set_app_server_window_hidden(&mut self, hidden: bool) {
-        self.primary.set_app_server_window_hidden(hidden);
-    }
-
-    fn status(&self) -> TransportStatus {
-        match self.active {
-            ActiveTransport::Primary => self.primary.status(),
-            ActiveTransport::Fallback => self.fallback.status(),
-            ActiveTransport::None => TransportStatus::default(),
-        }
-    }
-
-    async fn connect(&mut self) -> Result<(), TransportError> {
-        match self.primary.connect().await {
-            Ok(()) => {
-                self.active = ActiveTransport::Primary;
-                Ok(())
-            }
-            Err(primary_error) if self.fallback_enabled => {
-                self.primary.shutdown().await;
-                self.fallback.set_gui_fallback_enabled(true);
-                self.fallback.connect().await.map_err(|fallback_error| {
-                    TransportError::Unavailable(format!(
-                        "app-server failed ({primary_error}); explicitly enabled GUI fallback also failed ({fallback_error})"
-                    ))
-                })?;
-                self.active = ActiveTransport::Fallback;
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    async fn start_thread(&mut self, cwd: Option<&Path>) -> Result<ThreadSession, TransportError> {
-        match self.active {
-            ActiveTransport::Primary => self.primary.start_thread(cwd).await,
-            ActiveTransport::Fallback => self.fallback.start_thread(cwd).await,
-            ActiveTransport::None => Err(TransportError::NotConnected),
-        }
-    }
-
-    async fn resume_thread(
-        &mut self,
-        thread_id: &str,
-        cwd: Option<&Path>,
-    ) -> Result<ThreadSession, TransportError> {
-        match self.active {
-            ActiveTransport::Primary => self.primary.resume_thread(thread_id, cwd).await,
-            ActiveTransport::Fallback => self.fallback.resume_thread(thread_id, cwd).await,
-            ActiveTransport::None => Err(TransportError::NotConnected),
-        }
-    }
-
-    async fn start_turn(
-        &mut self,
-        thread_id: &str,
-        prompt: &str,
-        cwd: Option<&Path>,
-    ) -> Result<StartedTurn, TransportError> {
-        match self.active {
-            ActiveTransport::Primary => self.primary.start_turn(thread_id, prompt, cwd).await,
-            ActiveTransport::Fallback => self.fallback.start_turn(thread_id, prompt, cwd).await,
-            ActiveTransport::None => Err(TransportError::NotConnected),
-        }
-    }
-
-    async fn interrupt_turn(
-        &mut self,
-        thread_id: &str,
-        turn_id: &str,
-    ) -> Result<(), TransportError> {
-        match self.active {
-            ActiveTransport::Primary => self.primary.interrupt_turn(thread_id, turn_id).await,
-            ActiveTransport::Fallback => self.fallback.interrupt_turn(thread_id, turn_id).await,
-            ActiveTransport::None => Err(TransportError::NotConnected),
-        }
-    }
-
-    async fn next_event(&mut self) -> Option<TransportEvent> {
-        match self.active {
-            ActiveTransport::Primary => self.primary.next_event().await,
-            ActiveTransport::Fallback => self.fallback.next_event().await,
-            ActiveTransport::None => None,
-        }
-    }
-
-    async fn shutdown(&mut self) {
-        self.primary.shutdown().await;
-        self.fallback.shutdown().await;
-        self.active = ActiveTransport::None;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    use super::*;
-
-    #[derive(Debug)]
-    struct ConnectOnlyTransport {
-        fail: bool,
-        connects: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl CodexTransport for ConnectOnlyTransport {
-        async fn connect(&mut self) -> Result<(), TransportError> {
-            self.connects.fetch_add(1, Ordering::SeqCst);
-            if self.fail {
-                Err(TransportError::ExecutableNotFound("codex".into()))
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn start_thread(
-            &mut self,
-            _: Option<&Path>,
-        ) -> Result<ThreadSession, TransportError> {
-            unreachable!()
-        }
-
-        async fn resume_thread(
-            &mut self,
-            _: &str,
-            _: Option<&Path>,
-        ) -> Result<ThreadSession, TransportError> {
-            unreachable!()
-        }
-
-        async fn start_turn(
-            &mut self,
-            _: &str,
-            _: &str,
-            _: Option<&Path>,
-        ) -> Result<StartedTurn, TransportError> {
-            unreachable!()
-        }
-
-        async fn interrupt_turn(&mut self, _: &str, _: &str) -> Result<(), TransportError> {
-            unreachable!()
-        }
-
-        async fn next_event(&mut self) -> Option<TransportEvent> {
-            std::future::pending().await
-        }
-
-        async fn shutdown(&mut self) {}
-    }
-
-    #[tokio::test]
-    async fn a_disabled_gui_fallback_is_never_connected_silently() {
-        let primary_connects = Arc::new(AtomicUsize::new(0));
-        let fallback_connects = Arc::new(AtomicUsize::new(0));
-        let mut transport = PreferredTransport::new(
-            ConnectOnlyTransport {
-                fail: true,
-                connects: Arc::clone(&primary_connects),
-            },
-            ConnectOnlyTransport {
-                fail: false,
-                connects: Arc::clone(&fallback_connects),
-            },
-            false,
-        );
-
-        assert!(matches!(
-            transport.connect().await,
-            Err(TransportError::ExecutableNotFound(_))
-        ));
-        assert_eq!(primary_connects.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_connects.load(Ordering::SeqCst), 0);
-    }
 }

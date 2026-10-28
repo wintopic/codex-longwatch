@@ -28,8 +28,6 @@ pub mod backoff;
 pub mod classifier;
 pub mod config;
 pub mod diagnostics;
-pub mod gui_fallback;
-pub mod jsonl;
 pub mod queue;
 pub mod runtime;
 pub mod transport;

@@ -27,8 +27,24 @@ fn main() {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let id = message.get("id").cloned();
+        if message.get("method").is_none() {
+            // A client reply to one of our server requests.
+            if let Some(path) = &log {
+                fs::write(path, serde_json::to_vec(&message).unwrap())
+                    .expect("write client response log");
+            }
+            continue;
+        }
         match method {
             "initialize" => {
+                if let Some(path) = env::var_os("LONGWATCH_FAKE_INIT_LOG") {
+                    let record = json!({
+                        "params": message.get("params").cloned().unwrap_or(Value::Null),
+                        "originatorOverride": env::var("CODEX_INTERNAL_ORIGINATOR_OVERRIDE").ok()
+                    });
+                    fs::write(path, serde_json::to_vec(&record).unwrap())
+                        .expect("write initialize log");
+                }
                 respond(
                     &mut stdout,
                     id,
@@ -156,12 +172,6 @@ fn main() {
                     fs::write(path, b"interrupt").expect("write interrupt log");
                 }
                 respond(&mut stdout, id, json!({}));
-            }
-            _ if id.is_some() && message.get("error").is_some() => {
-                if let Some(path) = &log {
-                    fs::write(path, serde_json::to_vec(&message).unwrap())
-                        .expect("write client response log");
-                }
             }
             _ if id.is_some() => {
                 send(

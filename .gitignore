@@ -15,6 +15,7 @@ Cargo.toml.orig
 *.bak
 /.tmp_app_server_schema/
 /.longwatch-test/
+/.preview-*/
 *.log
 *.tmp
 .DS_Store

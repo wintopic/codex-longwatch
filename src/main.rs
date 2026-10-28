@@ -4,11 +4,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use codex_longwatch::{
-    app_server::AppServerTransport,
     config::ConfigStore,
     diagnostics,
-    runtime::spawn_runtime,
-    transport::{GuiFallbackTransport, PreferredTransport},
+    runtime::{prepare_startup_config, spawn_multi_app_server_runtime},
     ui,
 };
 use single_instance::SingleInstance;
@@ -53,13 +51,9 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let config = store.load_config()?;
+    let mut config = store.load_config()?;
     let state = store.load_state()?;
-    let transport = PreferredTransport::new(
-        AppServerTransport::new(config.codex_path.clone()).with_hidden_window(true),
-        GuiFallbackTransport::new(config.gui_fallback_enabled),
-        config.gui_fallback_enabled,
-    );
+    let startup_auto_sent = prepare_startup_config(&mut config, &state);
     let tokio_runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -67,9 +61,15 @@ fn run() -> Result<()> {
             .build()
             .context("无法创建后台运行时")?,
     );
-    let runtime = tokio_runtime
-        .block_on(async { spawn_runtime(transport, config.clone(), state, Some(store.clone())) });
-    ui::run(config, runtime, Arc::clone(&tokio_runtime));
+    let runtime = tokio_runtime.block_on(async {
+        spawn_multi_app_server_runtime(config.clone(), state, Some(store.clone()))
+    });
+    ui::run(
+        config,
+        runtime,
+        Arc::clone(&tokio_runtime),
+        startup_auto_sent,
+    );
     info!("Longwatch 已正常退出");
     drop(instance);
     Ok(())
@@ -96,11 +96,17 @@ fn init_logging(store: &ConfigStore) -> Result<WorkerGuard> {
 
 #[cfg(target_os = "windows")]
 fn install_panic_hook() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static PANIC_DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
     std::panic::set_hook(Box::new(|panic| {
         let panic_message = panic.to_string();
         let backtrace = std::backtrace::Backtrace::force_capture().to_string();
         let report_path = diagnostics::write_crash_report(&panic_message, &backtrace).ok();
         tracing::error!(panic = %panic, "Longwatch 发生未捕获 panic");
+        if PANIC_DIALOG_OPEN.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let message = report_path.map_or_else(
             || format!("{panic_message}\n\n崩溃报告写入失败，请查看日志目录。"),
             |path| {
@@ -111,6 +117,7 @@ fn install_panic_hook() {
             },
         );
         gpui_platform::show_error_dialog("Longwatch 意外退出", &message);
+        PANIC_DIALOG_OPEN.store(false, Ordering::Release);
     }));
 }
 
