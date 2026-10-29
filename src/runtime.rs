@@ -7,8 +7,6 @@ use std::{
 };
 
 use chrono::Utc;
-use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
@@ -19,7 +17,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    backoff::WakeDetector,
+    backoff::{WakeDetector, retry_delay},
     classifier::{
         CompletedStatus, TurnDecision, TurnError, classify_error_notification,
         classify_turn_completion,
@@ -186,6 +184,8 @@ where
     let mut initial = machine.snapshot().clone();
     initial.session_prompt = config.prompt.clone();
     initial.session_working_directory = config.working_directory.clone();
+    initial.session_model = config.model.clone();
+    initial.session_reasoning_effort = config.reasoning_effort.clone();
     initial.session_failure_phrases = config.failure_phrases.clone();
     initial.running_session_count = usize::from(initial.phase.is_running());
     initial.pending_task_count = usize::from(initial.queued_message.is_some());
@@ -216,11 +216,13 @@ pub struct QueueRuntime<T> {
     machine: QueueMachine,
     store: Option<ConfigStore>,
     snapshot_sender: watch::Sender<QueueSnapshot>,
-    rng: ChaCha8Rng,
     wake_detector: WakeDetector,
     started: bool,
     connected: bool,
     connection_failures: u32,
+    /// When the latest connect-or-send attempt began; keeps retries of an
+    /// instantly failing request `MIN_RETRY_SPACING` apart.
+    last_attempt_started: Option<Instant>,
     turn_deadline: Option<Instant>,
     success_notified: bool,
     /// Whether the logical user message for `config.prompt` is already in the
@@ -296,11 +298,11 @@ where
             machine,
             store,
             snapshot_sender,
-            rng: ChaCha8Rng::from_os_rng(),
             wake_detector: WakeDetector::new(now, monotonic),
             started: false,
             connected: false,
             connection_failures: 0,
+            last_attempt_started: None,
             turn_deadline: None,
             success_notified: false,
             current_prompt_recorded,
@@ -526,8 +528,8 @@ where
 
     /// Resume the existing Codex thread without consuming whatever happens to
     /// be in the editor as a fresh prompt.  A paused turn is reconciled by
-    /// `thread/resume`; if it was interrupted, the normal completion path will
-    /// schedule the conservative continuation retry.
+    /// `thread/resume`; if it was interrupted, the normal completion path
+    /// schedules the continuation retry.
     async fn handle_resume(&mut self) -> Result<(), RuntimeError> {
         if self.started {
             return Ok(());
@@ -635,6 +637,10 @@ where
             accepted
                 .default_working_directory
                 .clone_from(&config.default_working_directory);
+            accepted.default_model.clone_from(&config.default_model);
+            accepted
+                .default_reasoning_effort
+                .clone_from(&config.default_reasoning_effort);
             let only_live_settings_changed = accepted == config;
 
             self.config.default_prompt = config.default_prompt;
@@ -643,6 +649,8 @@ where
             self.config.audio_alert_enabled = config.audio_alert_enabled;
             self.config.max_concurrent_sessions = config.max_concurrent_sessions;
             self.config.default_working_directory = config.default_working_directory;
+            self.config.default_model = config.default_model;
+            self.config.default_reasoning_effort = config.default_reasoning_effort;
             // The identity is read on the next connect, so a running task
             // keeps its current connection and picks it up on reconnect.
             self.config.client_identity = config.client_identity;
@@ -681,6 +689,7 @@ where
     }
 
     async fn ensure_connection_and_thread(&mut self) -> Result<(), RuntimeError> {
+        self.last_attempt_started = Some(Instant::now());
         if !self.connected {
             self.machine.begin_connecting();
             self.publish_and_persist();
@@ -745,11 +754,10 @@ where
         let Some(turn) = session.latest_turn else {
             if self.started {
                 // If an earlier process died between `turn/start` and
-                // receiving its response, do not immediately resend.  Enter a
-                // normal backoff and let the user inspect the persisted state
-                // if the server cannot reconcile the thread.
+                // receiving its response, do not resend on the spot. The
+                // normal retry path resumes and reconciles the thread first.
                 if awaiting_outcome {
-                    self.schedule_retry("无法确认上一次回合是否已提交");
+                    self.schedule_retry("无法确认上一次回合是否已提交", true);
                 } else {
                     self.send_attempt().await?;
                 }
@@ -763,7 +771,7 @@ where
             self.machine.clear_active_turn();
             self.machine.clear_submission_uncertain();
             if turn.status == TurnStatus::InProgress {
-                self.schedule_retry("会话中另有回合正在进行，稍后再发送");
+                self.schedule_retry("会话中另有回合正在进行，稍后再发送", true);
             } else if self.started {
                 info!("上一次提交没有到达 Codex，重新发送");
                 self.send_attempt().await?;
@@ -869,6 +877,10 @@ where
             attempt = self.machine.snapshot().attempt_count,
             thread_id, "正在提交 Codex 回合"
         );
+        self.transport.set_model(
+            self.config.model.as_deref(),
+            self.config.reasoning_effort.as_deref(),
+        );
         let start_result = self
             .transport
             .start_turn(
@@ -961,12 +973,11 @@ where
                         self.machine.note_internal_retry_quiet(&reason);
                         self.publish_and_persist();
                     }
-                    TurnDecision::Retryable(reason) => self.schedule_retry(&reason),
-                    TurnDecision::RetryImmediately(reason) => {
-                        self.schedule_immediate_retry(&reason);
+                    TurnDecision::Retryable(reason) | TurnDecision::RetryImmediately(reason) => {
+                        self.schedule_retry(&reason, true);
                     }
                     TurnDecision::RetryImmediatelyQuiet(reason) => {
-                        self.schedule_quiet_immediate_retry(&reason);
+                        self.schedule_retry(&reason, false);
                     }
                     TurnDecision::Pause(reason) => {
                         self.machine.pause(&reason);
@@ -1015,7 +1026,7 @@ where
                 self.turn_deadline = None;
                 self.machine.clear_active_turn();
                 self.shutdown_transport().await;
-                self.schedule_retry("Codex 线程进入系统错误状态，正在重建连接");
+                self.schedule_retry("Codex 线程进入系统错误状态，正在重建连接", true);
             }
             TransportEvent::Disconnected { message } => {
                 if self.started {
@@ -1092,13 +1103,13 @@ where
                 if turn.final_message.trim().is_empty() {
                     self.machine.mark_empty_reply();
                 }
-                self.schedule_retry(&reason);
+                self.schedule_retry(&reason, true);
             }
             TurnDecision::RetryImmediately(reason) => {
-                self.schedule_immediate_retry(&reason);
+                self.schedule_retry(&reason, true);
             }
             TurnDecision::RetryImmediatelyQuiet(reason) => {
-                self.schedule_quiet_immediate_retry(&reason);
+                self.schedule_retry(&reason, false);
             }
             TurnDecision::WaitForInternalRetry(reason) => self.machine.note_internal_retry(&reason),
             TurnDecision::WaitForInternalRetryQuiet(reason) => {
@@ -1166,8 +1177,8 @@ where
             return Ok(());
         }
         if preserve_backoff {
-            // The retry deadline already encodes the conservative backoff.
-            // A stale event-stream close must not shorten it to five seconds.
+            // A retry is already scheduled; a stale event-stream close must
+            // not add a reconnect on top of it.
             self.publish_and_persist();
             return Ok(());
         }
@@ -1217,15 +1228,15 @@ where
                 match classify_error_notification(&error, false, &self.config.failure_phrases) {
                     TurnDecision::Retryable(reason) => {
                         info!(code, reason, "JSON-RPC 错误已归类为可重试");
-                        self.schedule_retry(&reason);
+                        self.schedule_retry(&reason, true);
                     }
                     TurnDecision::RetryImmediately(reason) => {
                         info!(code, reason, "JSON-RPC 错误触发立即重试");
-                        self.schedule_immediate_retry(&reason);
+                        self.schedule_retry(&reason, true);
                     }
                     TurnDecision::RetryImmediatelyQuiet(reason) => {
                         info!(code, reason, "JSON-RPC 高需求提示触发静默立即重试");
-                        self.schedule_quiet_immediate_retry(&reason);
+                        self.schedule_retry(&reason, false);
                     }
                     TurnDecision::WaitForInternalRetry(reason) => {
                         self.machine.note_internal_retry(&reason);
@@ -1266,15 +1277,16 @@ where
             self.machine.mark_retry_as_follow_up();
         }
         self.connection_failures = self.connection_failures.saturating_add(1);
-        let delay_seconds = connection_retry_delay_seconds(self.connection_failures);
+        let delay = retry_delay(self.last_attempt_started, Instant::now());
         self.machine.record_retry_alert();
         self.machine.begin_connecting();
         self.machine.set_status(&format!(
-            "{reason}；第 {} 次连接恢复，{} 秒后重试",
-            self.connection_failures, delay_seconds
+            "{reason}；第 {} 次重新连接",
+            self.connection_failures
         ));
-        self.machine
-            .set_next_attempt_at(Utc::now() + chrono::Duration::seconds(i64::from(delay_seconds)));
+        self.machine.set_next_attempt_at(
+            Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default(),
+        );
         self.publish_and_persist();
     }
 
@@ -1407,7 +1419,7 @@ where
                 self.machine.mark_retry_as_follow_up();
                 self.machine.clear_active_turn();
                 self.turn_deadline = None;
-                self.schedule_retry("回合超时，已发送中断请求");
+                self.schedule_retry("回合超时，已发送中断请求", true);
                 self.publish_and_persist();
             }
         } else if self.machine.snapshot().next_attempt_at.is_some() {
@@ -1416,7 +1428,10 @@ where
         Ok(())
     }
 
-    fn schedule_retry(&mut self, reason: &str) {
+    /// Retry right away. The only wait is what keeps two attempts of this task
+    /// `MIN_RETRY_SPACING` apart; `show_alert` is false for the plain "high
+    /// demand" notice, which is expected and not worth a retry alert.
+    fn schedule_retry(&mut self, reason: &str, show_alert: bool) {
         self.turn_deadline = None;
         if self.machine.snapshot().active_turn_id.is_some() {
             self.machine.mark_retry_as_follow_up();
@@ -1424,60 +1439,15 @@ where
         if self.machine.snapshot().reply_preview.trim().is_empty() {
             self.machine.set_reply_notice(reason);
         }
-        let next = self.machine.schedule_retry(
-            Utc::now(),
-            &self.config.retry_policy,
-            reason,
-            &mut self.rng,
-        );
-        self.machine
-            .set_status(&format!("{reason}；已安排低频重试"));
+        let delay = retry_delay(self.last_attempt_started, Instant::now());
+        let next = self
+            .machine
+            .schedule_retry(Utc::now(), delay, reason, show_alert);
         info!(
             retry_round = self.machine.snapshot().consecutive_retries,
             next_attempt_at = %next,
             reason,
-            "已安排下一次重试"
-        );
-        self.publish_and_persist();
-    }
-
-    fn schedule_immediate_retry(&mut self, reason: &str) {
-        const SETTLE_DELAY_SECS: i64 = 1;
-        let now = Utc::now();
-        self.turn_deadline = None;
-        if self.machine.snapshot().active_turn_id.is_some() {
-            self.machine.mark_retry_as_follow_up();
-        }
-        if self.machine.snapshot().reply_preview.trim().is_empty() {
-            self.machine.set_reply_notice(reason);
-        }
-        self.machine
-            .schedule_retry(now, &self.config.retry_policy, reason, &mut self.rng);
-        self.machine
-            .set_next_attempt_at(now + chrono::Duration::seconds(SETTLE_DELAY_SECS));
-        self.machine
-            .set_status(&format!("{reason}；正在开始新一轮尝试"));
-        info!(reason, "Codex 内部重试耗尽，正在衔接新一轮尝试");
-        self.publish_and_persist();
-    }
-
-    fn schedule_quiet_immediate_retry(&mut self, reason: &str) {
-        let now = Utc::now();
-        self.turn_deadline = None;
-        if self.machine.snapshot().active_turn_id.is_some() {
-            self.machine.mark_retry_as_follow_up();
-        }
-        if self.machine.snapshot().reply_preview.trim().is_empty() {
-            self.machine.set_reply_notice(reason);
-        }
-        let delay = self.config.retry_policy.high_demand_delay(&mut self.rng);
-        let next = self.machine.schedule_quiet_retry(now, delay, reason);
-        info!(
-            retry_round = self.machine.snapshot().consecutive_retries,
-            next_attempt_at = %next,
-            delay_secs = delay.as_secs(),
-            reason,
-            "高需求提示已按官方节奏重新排队"
+            "已安排立即重试"
         );
         self.publish_and_persist();
     }
@@ -1502,6 +1472,8 @@ where
         let mut snapshot = self.machine.snapshot().clone();
         snapshot.session_prompt = self.config.prompt.clone();
         snapshot.session_working_directory = self.config.working_directory.clone();
+        snapshot.session_model = self.config.model.clone();
+        snapshot.session_reasoning_effort = self.config.reasoning_effort.clone();
         snapshot.session_failure_phrases = self.config.failure_phrases.clone();
         snapshot.running_session_count = usize::from(snapshot.phase.is_running());
         snapshot.pending_task_count = usize::from(snapshot.queued_message.is_some());
@@ -1663,6 +1635,8 @@ where
         max_concurrent_sessions: config.max_concurrent_sessions,
         session_prompt: config.prompt.clone(),
         session_working_directory: config.working_directory.clone(),
+        session_model: config.model.clone(),
+        session_reasoning_effort: config.reasoning_effort.clone(),
         session_failure_phrases: config.failure_phrases.clone(),
         ..QueueSnapshot::default()
     };
@@ -1981,6 +1955,8 @@ where
         snapshot.session_id = Some(id);
         snapshot.session_prompt = config.prompt.clone();
         snapshot.session_working_directory = config.working_directory.clone();
+        snapshot.session_model = config.model.clone();
+        snapshot.session_reasoning_effort = config.reasoning_effort.clone();
         snapshot.session_failure_phrases = config.failure_phrases.clone();
         let assigned = snapshot.phase.is_running() || restore_is_active || auto_start_is_active;
         let assigned_order = self.next_assignment_order();
@@ -2130,6 +2106,12 @@ where
             worker_config
                 .default_working_directory
                 .clone_from(&config.default_working_directory);
+            worker_config
+                .default_model
+                .clone_from(&config.default_model);
+            worker_config
+                .default_reasoning_effort
+                .clone_from(&config.default_reasoning_effort);
             // Task content (prompt and working directory) arrives with each
             // submission; only queue-wide settings reach idle sessions here.
             if !slot.assigned && !slot.snapshot.phase.is_running() {
@@ -2314,6 +2296,8 @@ where
                     prompt: message.prompt,
                     working_directory: message.working_directory,
                     failure_phrases: message.failure_phrases,
+                    model: self.base_config.default_model.clone(),
+                    reasoning_effort: self.base_config.default_reasoning_effort.clone(),
                     ..self.base_config.clone()
                 };
                 let pending_id = self.enqueue(config, request_id, None, false);
@@ -2431,6 +2415,10 @@ where
             slot.snapshot.session_id = Some(slot.id);
             slot.config.prompt.clone_from(&slot.snapshot.session_prompt);
             slot.config.working_directory = slot.snapshot.session_working_directory.clone();
+            slot.config.model = slot.snapshot.session_model.clone();
+            slot.config
+                .reasoning_effort
+                .clone_from(&slot.snapshot.session_reasoning_effort);
             slot.config
                 .failure_phrases
                 .clone_from(&slot.snapshot.session_failure_phrases);
@@ -2737,14 +2725,6 @@ fn persisted_state_requires_recovery(state: &PersistedQueueState) -> bool {
         || state.queued_message.is_some()
 }
 
-const fn connection_retry_delay_seconds(failure_count: u32) -> u32 {
-    match failure_count {
-        0 | 1 => 5,
-        2 => 15,
-        _ => 60,
-    }
-}
-
 fn error_conversation_text(error: &TurnError) -> String {
     let message = error.message.trim();
     let details = error
@@ -3033,11 +3013,30 @@ mod tests {
     }
 
     #[test]
-    fn repeated_connection_failures_back_off_without_growing_forever() {
-        assert_eq!(connection_retry_delay_seconds(1), 5);
-        assert_eq!(connection_retry_delay_seconds(2), 15);
-        assert_eq!(connection_retry_delay_seconds(3), 60);
-        assert_eq!(connection_retry_delay_seconds(99), 60);
+    fn repeated_connection_failures_reconnect_without_growing_waits() {
+        let config = QueueConfig::default();
+        let machine = QueueMachine::new(config.codex_path.clone());
+        let (sender, _) = watch::channel(machine.snapshot().clone());
+        let mut runtime = QueueRuntime::new(NoopTransport, config, machine, None, sender);
+
+        for _ in 0..5 {
+            runtime.last_attempt_started = Some(Instant::now());
+            runtime.schedule_connection_retry("Codex app-server 尚未连接");
+            let next = runtime
+                .machine()
+                .snapshot()
+                .next_attempt_at
+                .expect("reconnect deadline is set");
+            assert!(next <= Utc::now() + chrono::Duration::seconds(2));
+        }
+        assert_eq!(runtime.connection_failures, 5);
+        assert!(
+            runtime
+                .machine()
+                .snapshot()
+                .status_message
+                .contains("第 5 次重新连接")
+        );
     }
 
     #[test]
@@ -3048,14 +3047,33 @@ mod tests {
         let mut runtime = QueueRuntime::new(NoopTransport, config, machine, None, sender);
         let before = Utc::now();
 
-        runtime.schedule_immediate_retry("Codex 内部 5 次重试已耗尽");
+        runtime.schedule_retry("Codex 内部 5 次重试已耗尽", true);
 
         let snapshot = runtime.machine().snapshot();
         let next = snapshot.next_attempt_at.expect("retry deadline is set");
         assert!(next >= before);
-        assert!(next <= Utc::now() + chrono::Duration::seconds(2));
+        assert!(next <= Utc::now() + chrono::Duration::milliseconds(100));
         assert_eq!(snapshot.phase, QueuePhase::Backoff);
-        assert!(snapshot.status_message.contains("正在开始新一轮尝试"));
+        assert!(snapshot.status_message.contains("立即重试"));
+    }
+
+    #[test]
+    fn an_instant_failure_still_keeps_attempts_two_seconds_apart() {
+        let config = QueueConfig::default();
+        let machine = QueueMachine::new(config.codex_path.clone());
+        let (sender, _) = watch::channel(machine.snapshot().clone());
+        let mut runtime = QueueRuntime::new(NoopTransport, config, machine, None, sender);
+        runtime.last_attempt_started = Some(Instant::now());
+
+        runtime.schedule_retry("Codex 暂时繁忙", true);
+
+        let next = runtime
+            .machine()
+            .snapshot()
+            .next_attempt_at
+            .expect("retry deadline is set");
+        assert!(next > Utc::now() + chrono::Duration::milliseconds(1500));
+        assert!(next <= Utc::now() + chrono::Duration::seconds(2));
     }
 
     #[tokio::test]
@@ -3341,7 +3359,15 @@ mod tests {
         snapshots: &mut watch::Receiver<QueueSnapshot>,
         phase: QueuePhase,
     ) -> QueueSnapshot {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        wait_for_phase_within(snapshots, phase, Duration::from_secs(2)).await
+    }
+
+    async fn wait_for_phase_within(
+        snapshots: &mut watch::Receiver<QueueSnapshot>,
+        phase: QueuePhase,
+        limit: Duration,
+    ) -> QueueSnapshot {
+        tokio::time::timeout(limit, async {
             loop {
                 let snapshot = snapshots.borrow().clone();
                 if snapshot.phase == phase {
@@ -4211,8 +4237,8 @@ mod tests {
         let task = tokio::spawn(runtime.run(receiver));
         commands.send(RuntimeCommand::Start).await.unwrap();
         let snapshot = wait_for_phase(&mut snapshots, QueuePhase::Backoff).await;
-        // The default backoff is at least 15 seconds away.
-        assert!(snapshot.next_attempt_at.unwrap() > Utc::now() + chrono::Duration::seconds(10));
+        // An instant failure waits out the rest of the two-second spacing.
+        assert!(snapshot.next_attempt_at.unwrap() > Utc::now() + chrono::Duration::seconds(1));
 
         commands.send(RuntimeCommand::RetryNow).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -4231,11 +4257,6 @@ mod tests {
         let (transport, starts, _) = ScriptedTransport::new(Script::CurrentHighDemandThenSuccess);
         let config = QueueConfig {
             prompt: "do real work".into(),
-            // 生产节奏是 10 秒；测试里压到 1 秒，仍然验证"不告警、只重排一次"。
-            retry_policy: crate::backoff::RetryPolicy {
-                high_demand_delay_secs: 1,
-                ..crate::backoff::RetryPolicy::default()
-            },
             ..QueueConfig::default()
         };
         let machine =
@@ -4246,7 +4267,11 @@ mod tests {
         let task = tokio::spawn(runtime.run(receiver));
 
         commands.send(RuntimeCommand::Start).await.unwrap();
-        let snapshot = wait_for_phase(&mut snapshots, QueuePhase::Success).await;
+        // The scripted notice arrives instantly, so the retry waits out the
+        // two-second spacing between attempts.
+        let snapshot =
+            wait_for_phase_within(&mut snapshots, QueuePhase::Success, Duration::from_secs(5))
+                .await;
 
         assert_eq!(snapshot.retry_alert_count, 0);
         assert_eq!(snapshot.attempt_count, 2);
@@ -5058,8 +5083,8 @@ mod tests {
         handle.send(RuntimeCommand::Resume).await.unwrap();
         let snapshot = wait_for_phase(&mut snapshots, QueuePhase::Success).await;
 
-        // The default backoff is 30 s; reaching success inside the 2 s wait
-        // proves the continuation went out immediately.
+        // Reaching success inside the 2 s wait proves the continuation went
+        // out at once instead of waiting for a retry.
         assert_eq!(snapshot.reply_preview, "fresh reply");
         let sent = sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 1);

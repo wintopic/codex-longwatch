@@ -990,8 +990,6 @@ dependencies = [
  "gpui_platform",
  "notify 6.1.1",
  "pretty_assertions",
- "rand 0.9.5",
- "rand_chacha 0.9.0",
  "raw-window-handle",
  "serde",
  "serde_json",

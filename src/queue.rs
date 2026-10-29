@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -218,6 +217,11 @@ pub struct QueueSnapshot {
     pub session_prompt: String,
     #[serde(default)]
     pub session_working_directory: Option<PathBuf>,
+    /// Model and reasoning effort the selected session sends to Codex.
+    #[serde(default)]
+    pub session_model: Option<String>,
+    #[serde(default)]
+    pub session_reasoning_effort: Option<String>,
     #[serde(default)]
     pub session_failure_phrases: Vec<String>,
     /// Selected independent Longwatch session, if the pool has created one.
@@ -275,6 +279,8 @@ impl Default for QueueSnapshot {
             transport_status: TransportStatus::default(),
             session_prompt: String::new(),
             session_working_directory: None,
+            session_model: None,
+            session_reasoning_effort: None,
             session_failure_phrases: Vec::new(),
             session_id: None,
             sessions: Vec::new(),
@@ -347,6 +353,8 @@ impl QueueMachine {
                 transport_status: TransportStatus::default(),
                 session_prompt: String::new(),
                 session_working_directory: None,
+                session_model: None,
+                session_reasoning_effort: None,
                 session_failure_phrases: Vec::new(),
                 session_id: None,
                 sessions: Vec::new(),
@@ -649,22 +657,15 @@ impl QueueMachine {
         self.snapshot.empty_reply_count = 0;
     }
 
-    pub fn schedule_retry<R: Rng + ?Sized>(
+    /// Queue the next attempt `delay` from `now`. Failed attempts are retried
+    /// right away, so `delay` only ever covers the minimum spacing between two
+    /// attempts. A quiet retry (the plain "high demand" notice) does not raise
+    /// a retry alert.
+    pub fn schedule_retry(
         &mut self,
         now: DateTime<Utc>,
-        policy: &RetryPolicy,
+        delay: std::time::Duration,
         reason: &str,
-        rng: &mut R,
-    ) -> DateTime<Utc> {
-        self.schedule_retry_with_alert(now, policy, reason, rng, true)
-    }
-
-    pub fn schedule_retry_with_alert<R: Rng + ?Sized>(
-        &mut self,
-        now: DateTime<Utc>,
-        policy: &RetryPolicy,
-        reason: &str,
-        rng: &mut R,
         show_alert: bool,
     ) -> DateTime<Utc> {
         self.snapshot.active_turn_id = None;
@@ -673,43 +674,9 @@ impl QueueMachine {
         if show_alert {
             self.record_retry_alert();
         }
-        let delay = policy.delay_for(self.snapshot.consecutive_retries, rng);
         let next = now + chrono::Duration::from_std(delay).unwrap_or_default();
         self.snapshot.phase = QueuePhase::Backoff;
-        self.snapshot.status_message = format!("{reason}；已安排低频重试");
-        self.snapshot.next_attempt_at = Some(next);
-        next
-    }
-
-    /// Starts a new queue attempt immediately without entering the user-facing
-    /// backoff state or incrementing the retry-alert counter.
-    pub fn schedule_quiet_immediate_retry(
-        &mut self,
-        now: DateTime<Utc>,
-        reason: &str,
-    ) -> DateTime<Utc> {
-        self.schedule_quiet_retry(now, std::time::Duration::ZERO, reason)
-    }
-
-    /// 以固定节奏重新排队：不发告警、不进入低频退避，只是像人一样等一会儿
-    /// 再点一次发送。用于高需求 / 限流这类"马上重来就有机会"的场景。
-    pub fn schedule_quiet_retry(
-        &mut self,
-        now: DateTime<Utc>,
-        delay: std::time::Duration,
-        reason: &str,
-    ) -> DateTime<Utc> {
-        self.snapshot.active_turn_id = None;
-        self.snapshot.submission_uncertain = false;
-        self.snapshot.consecutive_retries = self.snapshot.consecutive_retries.saturating_add(1);
-        let seconds = if delay.is_zero() {
-            0
-        } else {
-            delay.as_secs().max(1)
-        };
-        let next = now + chrono::Duration::from_std(delay).unwrap_or_default();
-        self.snapshot.phase = QueuePhase::Backoff;
-        self.snapshot.status_message = format!("{reason}；{seconds} 秒后再次排队");
+        self.snapshot.status_message = format!("{reason}；立即重试");
         self.snapshot.next_attempt_at = Some(next);
         next
     }
@@ -789,8 +756,6 @@ pub enum QueueError {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
-    use rand::SeedableRng;
-    use rand_chacha::ChaCha8Rng;
 
     use super::*;
 
@@ -810,8 +775,7 @@ mod tests {
     fn wake_reschedules_without_catch_up_burst() {
         let now = Utc.with_ymd_and_hms(2026, 7, 28, 1, 0, 0).unwrap();
         let mut machine = QueueMachine::new("codex".into());
-        let mut rng = ChaCha8Rng::seed_from_u64(4);
-        machine.schedule_retry(now, &RetryPolicy::default(), "busy", &mut rng);
+        machine.schedule_retry(now, std::time::Duration::ZERO, "busy", true);
         let wake = now + chrono::Duration::hours(5);
         machine.delay_after_wake(wake, &RetryPolicy::default());
         assert!(machine.snapshot.next_attempt_at.unwrap() >= wake + chrono::Duration::seconds(60));
@@ -833,32 +797,42 @@ mod tests {
     }
 
     #[test]
-    fn quiet_retry_waits_one_official_cadence_without_alert() {
+    fn a_failed_attempt_is_retried_immediately() {
         let now = Utc.with_ymd_and_hms(2026, 7, 28, 1, 0, 0).unwrap();
         let mut machine = QueueMachine::new("codex".into());
 
-        let next =
-            machine.schedule_quiet_retry(now, std::time::Duration::from_secs(10), "高需求提示");
+        let next = machine.schedule_retry(now, std::time::Duration::ZERO, "busy", true);
 
-        assert_eq!(next, now + chrono::Duration::seconds(10));
+        assert_eq!(next, now);
         assert_eq!(machine.snapshot.phase, QueuePhase::Backoff);
-        assert_eq!(
-            machine.snapshot.next_attempt_at,
-            Some(now + chrono::Duration::seconds(10))
-        );
-        assert_eq!(machine.snapshot.retry_alert_count, 0);
-        assert!(machine.snapshot.status_message.contains("再次排队"));
+        assert_eq!(machine.snapshot.next_attempt_at, Some(now));
+        assert_eq!(machine.snapshot.consecutive_retries, 1);
+        assert_eq!(machine.snapshot.retry_alert_count, 1);
+        assert!(machine.snapshot.status_message.contains("立即重试"));
     }
 
     #[test]
-    fn zero_delay_quiet_retry_keeps_the_connecting_path() {
+    fn retries_never_grow_their_delay() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 28, 1, 0, 0).unwrap();
+        let mut machine = QueueMachine::new("codex".into());
+        let spacing = std::time::Duration::from_secs(2);
+
+        for round in 0..20_i64 {
+            let failed_at = now + chrono::Duration::minutes(round);
+            let next = machine.schedule_retry(failed_at, spacing, "busy", true);
+            assert_eq!(next, failed_at + chrono::Duration::seconds(2));
+        }
+        assert_eq!(machine.snapshot.consecutive_retries, 20);
+    }
+
+    #[test]
+    fn quiet_retry_does_not_raise_an_alert() {
         let now = Utc.with_ymd_and_hms(2026, 7, 28, 1, 0, 0).unwrap();
         let mut machine = QueueMachine::new("codex".into());
 
-        let next = machine.schedule_quiet_immediate_retry(now, "内部重试耗尽");
+        let next = machine.schedule_retry(now, std::time::Duration::ZERO, "高需求提示", false);
 
         assert_eq!(next, now);
-        assert_eq!(machine.snapshot.next_attempt_at, Some(now));
         assert_eq!(machine.snapshot.retry_alert_count, 0);
     }
 

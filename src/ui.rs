@@ -3,11 +3,12 @@
 //! The layout follows the Qoder workbench: a 40 px title bar and a sidebar on
 //! a tinted shell, next to one bordered content card. The sidebar *is* the
 //! queue — running, waiting and finished tasks — so the window answers "what
-//! is queued and how far along is it?" at a glance. Everything else (retry
-//! tuning, diagnostics) lives on the settings page.
+//! is queued and how far along is it?" at a glance. Everything else (queue
+//! settings, diagnostics) lives on the settings page, except the model, which
+//! is picked in the input box like the folder.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -19,11 +20,12 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, Div, ElementId,
-    Entity, EntityInputHandler, Focusable, FontWeight, Image, ImageFormat, KeyDownEvent,
-    PathPromptOptions, Render, ScrollHandle, SharedString, Stateful, StyleRefinement, Timer,
-    TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions, div,
-    img, point, prelude::*, px, rgb, rgba, size,
+    AnyElement, App, Application, Bounds, BoxShadow, ClipboardItem, Context, Corner, Div,
+    ElementId, Entity, EntityInputHandler, Focusable, FontWeight, Image, ImageFormat, KeyDownEvent,
+    MouseDownEvent, PathPromptOptions, Pixels, Render, ScrollHandle, SharedString, Stateful,
+    StyleRefinement, Timer, TitlebarOptions, Window, WindowAppearance, WindowBounds,
+    WindowControlArea, WindowOptions, anchored, canvas, deferred, div, img, point, prelude::*, px,
+    rgb, rgba, size,
 };
 use gpui_component::{
     Root as ComponentRoot,
@@ -38,6 +40,7 @@ use tdesign_gpui::{
 use tracing::warn;
 
 use crate::{
+    app_server::fetch_model_catalog,
     config::{
         ClientIdentity, ConfigStore, MAX_CONCURRENT_SESSIONS, MIN_CONCURRENT_SESSIONS, QueueConfig,
     },
@@ -47,6 +50,7 @@ use crate::{
         QueueSnapshot,
     },
     runtime::{RuntimeCommand, RuntimeHandle},
+    transport::ModelCatalog,
 };
 
 const TITLEBAR_HEIGHT: f32 = 40.;
@@ -241,6 +245,14 @@ struct Notice {
     error: bool,
 }
 
+/// The model list is optional: without it the picker still offers "follow
+/// Codex settings", and the chip falls back to a generic label.
+enum ModelCatalogState {
+    Loading,
+    Ready(ModelCatalog),
+    Failed,
+}
+
 // Independent view flags (copy feedback, dialogs, validation) rather than a
 // state machine.
 #[allow(clippy::struct_excessive_bools)]
@@ -260,6 +272,13 @@ struct QueueView {
     placeholder: &'static str,
     /// `None` while `codex --version` is still running in the background.
     codex_cli: Option<CodexCliInfo>,
+    /// Models Codex offers, read in the background once the CLI is found.
+    model_catalog: ModelCatalogState,
+    model_menu_open: bool,
+    /// Where the model chip was last painted; its menu opens above it.
+    model_chip_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Runs the app-server that lists models; the UI thread is not in Tokio.
+    tokio: tokio::runtime::Handle,
     logo: Arc<Image>,
     next_request_id: u64,
     /// Submission whose text was cleared optimistically, restored if rejected.
@@ -336,6 +355,7 @@ impl QueueView {
     }
 
     fn select(&mut self, selection: Selection, window: &mut Window, cx: &mut Context<Self>) {
+        self.model_menu_open = false;
         if self.page == Page::Settings {
             self.save_text_settings(cx);
             self.page = Page::Queue;
@@ -441,6 +461,8 @@ impl QueueView {
                 let config = QueueConfig {
                     prompt: prompt.clone(),
                     working_directory: self.config.default_working_directory.clone(),
+                    model: self.config.default_model.clone(),
+                    reasoning_effort: self.config.default_reasoning_effort.clone(),
                     ..self.config.clone()
                 };
                 let sent = self.send(RuntimeCommand::StartNewConfigured { config, request_id });
@@ -450,10 +472,12 @@ impl QueueView {
                 sent
             }
             ComposerTarget::FollowUp { session_id, .. } => {
-                // Follow-ups stay in the conversation's own folder.
+                // Follow-ups stay in the conversation's own folder and model.
                 let config = QueueConfig {
                     prompt: prompt.clone(),
                     working_directory: self.snapshot.session_working_directory.clone(),
+                    model: self.snapshot.session_model.clone(),
+                    reasoning_effort: self.snapshot.session_reasoning_effort.clone(),
                     ..self.config.clone()
                 };
                 self.request_runtime_selection(session_id);
@@ -595,6 +619,235 @@ impl QueueView {
         cx.notify();
     }
 
+    /// Read the model list with a short-lived app-server, the same request
+    /// the official app makes for its picker.
+    fn load_models(&mut self, cx: &mut Context<Self>) {
+        self.model_catalog = ModelCatalogState::Loading;
+        let fetch = self.tokio.spawn(fetch_model_catalog(
+            self.config.codex_path.clone(),
+            self.config.client_identity,
+        ));
+        cx.spawn(async move |view, cx| {
+            let catalog = match fetch.await {
+                Ok(Ok(catalog)) => ModelCatalogState::Ready(catalog),
+                Ok(Err(error)) => {
+                    warn!(%error, "无法读取 Codex 模型列表");
+                    ModelCatalogState::Failed
+                }
+                Err(error) => {
+                    warn!(%error, "读取 Codex 模型列表的后台任务异常结束");
+                    ModelCatalogState::Failed
+                }
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.model_catalog = catalog;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_model_menu(&mut self, cx: &mut Context<Self>) {
+        self.model_menu_open = !self.model_menu_open;
+        if self.model_menu_open && matches!(self.model_catalog, ModelCatalogState::Failed) {
+            self.load_models(cx);
+        }
+        cx.notify();
+    }
+
+    /// Pick the model for new tasks. A model keeps the menu open so its
+    /// reasoning effort can be chosen next; the effort carries over when the
+    /// new model supports it and otherwise goes back to 默认 (Codex decides).
+    fn choose_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+        let effort = match (&self.model_catalog, model.as_deref()) {
+            (ModelCatalogState::Ready(catalog), Some(model)) => {
+                catalog.find(model).and_then(|info| {
+                    self.config
+                        .default_reasoning_effort
+                        .clone()
+                        .filter(|current| info.efforts.contains(current))
+                })
+            }
+            _ => None,
+        };
+        if model.is_none() {
+            self.model_menu_open = false;
+        }
+        self.config.default_model = model;
+        self.config.default_reasoning_effort = effort;
+        self.configure();
+        cx.notify();
+    }
+
+    /// `None` is 默认: Codex uses the effort from its config, or the model's
+    /// own default.
+    fn choose_effort(&mut self, effort: Option<String>, cx: &mut Context<Self>) {
+        self.config.default_reasoning_effort = effort;
+        self.model_menu_open = false;
+        self.configure();
+        cx.notify();
+    }
+
+    fn catalog(&self) -> Option<&ModelCatalog> {
+        match &self.model_catalog {
+            ModelCatalogState::Ready(catalog) => Some(catalog),
+            ModelCatalogState::Loading | ModelCatalogState::Failed => None,
+        }
+    }
+
+    fn model_name(&self, model: &str) -> String {
+        self.catalog()
+            .and_then(|catalog| catalog.find(model))
+            .map_or_else(|| model.to_owned(), |info| info.display_name.clone())
+    }
+
+    /// Chip text: the chosen model and effort, or the model Codex falls back
+    /// to when Longwatch sends none.
+    fn model_label(&self, model: Option<&str>, effort: Option<&str>) -> String {
+        match (model, effort) {
+            (Some(model), Some(effort)) => {
+                format!("{} · {}", self.model_name(model), effort_label(effort))
+            }
+            (Some(model), None) => self.model_name(model),
+            (None, _) => self
+                .catalog()
+                .and_then(ModelCatalog::default_model)
+                .map_or_else(
+                    || "默认模型".to_owned(),
+                    |model| format!("默认 · {}", self.model_name(model)),
+                ),
+        }
+    }
+
+    fn render_model_menu(
+        &self,
+        chip: Bounds<Pixels>,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chosen_model = self.config.default_model.as_deref();
+        let chosen_effort = self.config.default_reasoning_effort.as_deref();
+        let catalog = self.catalog();
+        let default_detail = catalog.and_then(ModelCatalog::default_model).map(|model| {
+            let name = self.model_name(model);
+            match catalog.and_then(|catalog| catalog.configured_effort.as_deref()) {
+                Some(effort) => format!("当前为 {name} · {}", effort_label(effort)),
+                None => format!("当前为 {name}"),
+            }
+        });
+        let room_above = f32::from(chip.top()) - TITLEBAR_HEIGHT - 20.;
+        let mut menu = div()
+            .id("model-menu")
+            .occlude()
+            .w(px(MODEL_MENU_WIDTH))
+            .max_h(px(room_above.clamp(160., 480.)))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .p(px(4.))
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(palette.border_tertiary))
+            .bg(rgb(palette.base))
+            .shadow(palette.overlay_shadow())
+            .on_mouse_down_out(cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                // A press on the chip itself is its own toggle.
+                if !chip.contains(&event.position) {
+                    view.model_menu_open = false;
+                    cx.notify();
+                }
+            }))
+            .child(menu_section("模型", palette))
+            .child(
+                model_menu_item(
+                    "model-default",
+                    "跟随 Codex 设置",
+                    default_detail,
+                    chosen_model.is_none(),
+                    palette,
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.choose_model(None, cx))),
+            );
+        match &self.model_catalog {
+            ModelCatalogState::Loading => {
+                menu = menu.child(menu_note("正在读取 Codex 的模型列表…", palette));
+            }
+            ModelCatalogState::Failed => {
+                menu = menu.child(menu_note("无法读取模型列表", palette)).child(
+                    model_menu_item("model-reload", "重新读取", None, false, palette)
+                        .on_click(cx.listener(|view, _, _, cx| view.load_models(cx))),
+                );
+            }
+            ModelCatalogState::Ready(catalog) => {
+                for (index, info) in catalog.models.iter().enumerate() {
+                    let model = info.model.clone();
+                    menu = menu.child(
+                        model_menu_item(
+                            ElementId::Name(format!("model-option-{index}").into()),
+                            &info.display_name,
+                            None,
+                            chosen_model == Some(info.model.as_str()),
+                            palette,
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.choose_model(Some(model.clone()), cx);
+                        })),
+                    );
+                }
+            }
+        }
+        if let Some(info) = chosen_model
+            .and_then(|model| catalog?.find(model))
+            .filter(|info| !info.efforts.is_empty())
+        {
+            let mut efforts = div()
+                .flex_none()
+                .flex()
+                .flex_wrap()
+                .gap(px(4.))
+                .px(px(6.))
+                .pb(px(6.))
+                .child(
+                    effort_pill("effort-default", "默认", chosen_effort.is_none(), palette)
+                        .on_click(cx.listener(|view, _, _, cx| view.choose_effort(None, cx))),
+                );
+            for (index, effort) in info.efforts.iter().enumerate() {
+                let value = effort.clone();
+                efforts = efforts.child(
+                    effort_pill(
+                        ElementId::Name(format!("effort-option-{index}").into()),
+                        effort_label(effort),
+                        chosen_effort == Some(effort.as_str()),
+                        palette,
+                    )
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.choose_effort(Some(value.clone()), cx);
+                    })),
+                );
+            }
+            menu = menu
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(1.))
+                        .mx(px(4.))
+                        .my(px(4.))
+                        .bg(rgb(palette.border_tertiary)),
+                )
+                .child(menu_section("推理强度", palette))
+                .child(efforts);
+        }
+        deferred(
+            anchored()
+                .snap_to_window_with_margin(px(8.))
+                .anchor(Corner::BottomRight)
+                .position(point(chip.right(), chip.top() - px(6.)))
+                .child(menu),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+
     fn adjust_concurrency(&mut self, delta: i16, cx: &mut Context<Self>) {
         let next = (i16::from(self.config.max_concurrent_sessions) + delta).clamp(
             i16::from(MIN_CONCURRENT_SESSIONS),
@@ -677,7 +930,11 @@ impl QueueView {
         let key = event.keystroke.key.as_str();
         let modifiers = &event.keystroke.modifiers;
         if key == "escape" {
-            if self.exit_confirm_open {
+            if self.model_menu_open {
+                self.model_menu_open = false;
+                cx.notify();
+                cx.stop_propagation();
+            } else if self.exit_confirm_open {
                 self.exit_confirm_open = false;
                 cx.notify();
                 cx.stop_propagation();
@@ -2093,9 +2350,67 @@ impl QueueView {
                 )
                 .on_click(cx.listener(|view, _, _, cx| view.clear_folder(cx)))
         });
+        // Follow-ups keep their conversation's model, like its folder.
+        let (model, effort) = if folder_editable {
+            (
+                self.config.default_model.as_deref(),
+                self.config.default_reasoning_effort.as_deref(),
+            )
+        } else {
+            (
+                self.snapshot.session_model.as_deref(),
+                self.snapshot.session_reasoning_effort.as_deref(),
+            )
+        };
+        let chip_bounds = Rc::clone(&self.model_chip_bounds);
+        let mut model_chip = div()
+            .id("model-chip")
+            .relative()
+            .h(px(28.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(6.))
+            .rounded_full()
+            .child(model_orb(palette))
+            .child(
+                div()
+                    .whitespace_nowrap()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(palette.text_secondary))
+                    .child(ellipsize(&self.model_label(model, effort), 170., 12.)),
+            )
+            .child(
+                canvas(
+                    move |bounds, _, _| chip_bounds.set(Some(bounds)),
+                    |_, (), _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
+        if folder_editable {
+            model_chip = model_chip
+                .cursor_pointer()
+                .when(self.model_menu_open, |this| {
+                    this.bg(rgb(palette.fill_secondary))
+                })
+                .hover(move |style| style.bg(rgb(palette.fill_secondary)))
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(px(12.))
+                        .color(rgb(palette.text_quaternary)),
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.toggle_model_menu(cx)));
+        }
+        let model_menu = (folder_editable && self.model_menu_open)
+            .then(|| self.model_chip_bounds.get())
+            .flatten()
+            .map(|chip| self.render_model_menu(chip, palette, cx));
         let hint = if self.prompt_error {
             Some(("请先输入任务内容", palette.error))
-        } else if large {
+        } else if large && self.chat_width() >= 680. {
             Some(("Enter 发送 · Shift+Enter 换行", palette.text_quaternary))
         } else {
             None
@@ -2177,6 +2492,8 @@ impl QueueView {
                                 .child(hint),
                         )
                     })
+                    .child(model_chip)
+                    .when_some(model_menu, |this, menu| this.child(menu))
                     .child(send_button),
             )
             .into_any_element()
@@ -2765,6 +3082,148 @@ fn session_tone(session: &QueueSessionSummary, palette: Palette) -> u32 {
         QueuePhase::FatalError => palette.error,
         _ => palette.text_tertiary,
     }
+}
+
+const MODEL_MENU_WIDTH: f32 = 280.;
+
+/// Chinese label for a Codex reasoning effort; unknown values show as-is.
+fn effort_label(effort: &str) -> &str {
+    match effort {
+        "none" => "关闭",
+        "minimal" => "最低",
+        "low" => "低",
+        "medium" => "中",
+        "high" => "高",
+        "xhigh" => "超高",
+        "max" => "最大",
+        "ultra" => "极限",
+        other => other,
+    }
+}
+
+/// The kit's `q-model-orb`: a small tinted disc in front of the model name.
+fn model_orb(palette: Palette) -> Div {
+    div()
+        .size(px(16.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(rgb(palette.primary_bg))
+        .child(
+            Icon::new(IconName::Ai)
+                .size(px(12.))
+                .color(rgb(palette.primary_text)),
+        )
+}
+
+fn menu_section(title: &'static str, palette: Palette) -> Div {
+    div()
+        .flex_none()
+        .px(px(8.))
+        .pt(px(6.))
+        .pb(px(4.))
+        .text_size(px(11.))
+        .line_height(px(14.))
+        .text_color(rgb(palette.text_tertiary))
+        .child(title)
+}
+
+fn menu_note(text: &'static str, palette: Palette) -> Div {
+    div()
+        .flex_none()
+        .px(px(8.))
+        .py(px(8.))
+        .text_size(px(12.))
+        .line_height(px(16.))
+        .text_color(rgb(palette.text_tertiary))
+        .child(text)
+}
+
+fn model_menu_item(
+    id: impl Into<ElementId>,
+    title: &str,
+    detail: Option<String>,
+    selected: bool,
+    palette: Palette,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .w_full()
+        .min_h(px(32.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .cursor_pointer()
+        .hover(move |style| style.bg(rgb(palette.fill_secondary)))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .line_height(px(16.))
+                        .text_color(rgb(palette.text))
+                        .when(selected, |this| this.font_weight(FontWeight::MEDIUM))
+                        .child(ellipsize(title, MODEL_MENU_WIDTH - 56., 12.)),
+                )
+                .when_some(detail, |this, detail| {
+                    this.child(
+                        div()
+                            .text_size(px(11.))
+                            .line_height(px(14.))
+                            .text_color(rgb(palette.text_tertiary))
+                            .child(ellipsize(&detail, MODEL_MENU_WIDTH - 56., 11.)),
+                    )
+                }),
+        )
+        .when(selected, |this| {
+            this.child(
+                Icon::new(IconName::Check)
+                    .size(px(14.))
+                    .color(rgb(palette.primary)),
+            )
+        })
+}
+
+fn effort_pill(
+    id: impl Into<ElementId>,
+    label: &str,
+    selected: bool,
+    palette: Palette,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(26.))
+        .px(px(6.))
+        .flex()
+        .items_center()
+        .rounded(px(8.))
+        .text_size(px(12.))
+        .cursor_pointer()
+        .when(selected, |this| {
+            this.bg(rgb(palette.primary_bg))
+                .text_color(rgb(palette.primary_text))
+                .font_weight(FontWeight::MEDIUM)
+        })
+        .when(!selected, |this| {
+            this.text_color(rgb(palette.text_secondary))
+                .hover(move |style| {
+                    style
+                        .bg(rgb(palette.fill_secondary))
+                        .text_color(rgb(palette.text))
+                })
+        })
+        .child(label.to_owned())
 }
 
 fn status_pill(label: &str, tone: u32, palette: Palette) -> AnyElement {
@@ -3524,6 +3983,7 @@ fn new_view(
     logs_directory: PathBuf,
     closing: Arc<AtomicBool>,
     startup_auto_sent: bool,
+    tokio: tokio::runtime::Handle,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<QueueView> {
@@ -3593,6 +4053,10 @@ fn new_view(
             phrases_input,
             placeholder: "描述要交给 Codex 的任务，按 Enter 加入队列",
             codex_cli: None,
+            model_catalog: ModelCatalogState::Loading,
+            model_menu_open: false,
+            model_chip_bounds: Rc::new(Cell::new(None)),
+            tokio,
             logo,
             next_request_id: 0,
             pending_clear: None,
@@ -3625,6 +4089,7 @@ pub fn run(
     startup_auto_sent: bool,
 ) {
     let shutdown_runtime = Arc::clone(&tokio_runtime);
+    let tokio_handle = tokio_runtime.handle().clone();
     let commands = runtime.command_sender();
     let mut snapshots = runtime.snapshot();
     let config_directory = ConfigStore::discover()
@@ -3667,6 +4132,7 @@ pub fn run(
                         let config_directory = config_directory.clone();
                         let logs_directory = logs_directory.clone();
                         let closing = Arc::clone(&closing);
+                        let tokio_handle = tokio_handle.clone();
                         move |app_window, cx| {
                             // `codex --version` goes through a node shim that can
                             // take seconds; never make the window wait for it.
@@ -3679,6 +4145,7 @@ pub fn run(
                                 logs_directory,
                                 Arc::clone(&closing),
                                 startup_auto_sent,
+                                tokio_handle,
                                 app_window,
                                 cx,
                             );
@@ -3710,6 +4177,11 @@ pub fn run(
                             cx.spawn(async move |cx| {
                                 let info = detection.await;
                                 let _ = detected_view.update(cx, |view, cx| {
+                                    if info.available() {
+                                        view.load_models(cx);
+                                    } else {
+                                        view.model_catalog = ModelCatalogState::Failed;
+                                    }
                                     view.codex_cli = Some(info);
                                     cx.notify();
                                 });

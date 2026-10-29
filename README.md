@@ -32,7 +32,7 @@
 
 When Codex is busy it replies with “We're currently experiencing high demand…”. Streams also get cut, and laptops go to sleep halfway through a job. Babysitting a long task means watching for the error and pressing send again. Pressing send blindly is worse: if the first request *did* arrive, the same work now runs twice.
 
-Longwatch does the waiting for you. You describe a task once. Longwatch sends it through your own Codex CLI and tells busy and transient failures apart from real answers. It waits a sensible amount of time and tries again, and it never has two requests in flight for the same conversation. When a valid reply arrives, a notification with a **查看** (View) button takes you straight to it.
+Longwatch does the waiting for you. You describe a task once. Longwatch sends it through your own Codex CLI and tells busy and transient failures apart from real answers. It tries again right away, and it never has two requests in flight for the same conversation. When a valid reply arrives, a notification with a **查看** (View) button takes you straight to it.
 
 It is not a way around limits. It adds no filler prompts, rotates no accounts, and never runs parallel retries of the same task.
 
@@ -41,7 +41,8 @@ It is not a way around limits. It adds no filler prompts, rotates no accounts, a
 - **Queue-first workbench.** The sidebar *is* the queue: running, retrying with a live countdown, waiting by position, finished. The main pane shows one task's conversation, and you can keep chatting there.
 - **The same requests as the official app.** Longwatch drives the same local `codex app-server` that the official Codex desktop app uses, and introduces itself the same way. Upstream requests therefore carry `originator: Codex Desktop` and the same User-Agent. You can change this under [Request identity](#request-identity).
 - **Never submits twice.** Each conversation has at most one active turn. A write-ahead marker is saved before every send, and after a crash or restart Longwatch reconciles by `clientUserMessageId`.
-- **Patient, Codex-aware retries.** Peak-load notices re-queue about every 10 seconds. Other transient failures back off from 30 seconds to 10 minutes. Authentication, quota and policy errors pause and wait for you.
+- **Immediate, Codex-aware retries.** A failed attempt is sent again right away, with no growing backoff; two attempts of the same task are only ever kept 2 seconds apart. Authentication, quota and policy errors pause and wait for you.
+- **Pick the model.** The model button in the input box lists the models Codex offers, each with its reasoning efforts. By default a task follows your Codex `config.toml`.
 - **Sleep-safe.** After the machine wakes, Longwatch waits at least 60 seconds and never fires a burst of missed retries.
 - **Several tasks at once, if you want.** Run 1–8 independent conversations side by side; the rest wait in first-in, first-out order.
 - **Hard to miss when it's done.** On Windows, an alarm-style notification keeps ringing until you click **查看**. macOS and Linux use native notifications with the same action.
@@ -81,7 +82,7 @@ The interface is in Simplified Chinese. English names are given in parentheses b
 
 | Sidebar group | What it shows |
 | --- | --- |
-| **进行中** (Running) `n/max` | Tasks with a live Codex conversation, either **处理中** (working) or a countdown such as `5 秒后重试 · 已尝试 3 次` (retry in 5 s · 3 attempts so far). |
+| **进行中** (Running) `n/max` | Tasks with a live Codex conversation, either **处理中** (working) or a retry note such as `1 秒后重试 · 已尝试 8 次` (retry in 1 s · 8 attempts so far). |
 | **排队中** (Queued) | Tasks waiting for a free lane, in submission order, e.g. `第 1 位 · 等待空闲通道` (position 1 · waiting for a free lane). |
 | **已完成** (Finished) | Completed, stopped and failed tasks. **清除** (Clear) removes the finished ones. |
 
@@ -93,6 +94,7 @@ The dot beside **设置** (Settings) at the bottom of the sidebar shows the Code
 | --- | --- |
 | Add a task | **新任务** (`Ctrl+N`), type, press `Enter`. `Shift+Enter` inserts a line break. |
 | Choose the working folder | Click the folder button under the text box (**默认目录**, “default folder”, until you pick one). |
+| Choose the model | Click the model button at the right of the text box. See [Choosing a model](#choosing-a-model). |
 | Follow up | Select the task and type. While a turn is still running, the message is held and sent when the turn ends; **撤回** (Withdraw) takes it back. |
 | Pause and resume | **暂停** (Pause) interrupts the current turn and keeps the conversation. **继续** (Continue) asks Codex to carry on where it stopped. |
 | Stop | **停止** (Stop) ends the current turn but keeps the conversation, so your next message continues it. |
@@ -102,6 +104,16 @@ The dot beside **设置** (Settings) at the bottom of the sidebar shows the Code
 | Delete a task | **移除** (Remove) on a task that is no longer running. |
 
 Results open through a `codex://threads/<id>` link, which shows the conversation in the Codex desktop app. If nothing handles that link, Longwatch runs `codex resume <id>` instead.
+
+### Choosing a model
+
+The model button sits at the right of the input box, next to the send button. Its menu lists the models your Codex CLI offers (the official `model/list`), and below them the reasoning efforts of the selected model.
+
+![The model menu: follow Codex settings, the models Codex offers, and the reasoning efforts of the chosen model](docs/assets/longwatch-model-picker.png)
+
+- **跟随 Codex 设置** (follow Codex settings) is the default. Longwatch then sends no model at all, so Codex uses the `model` and `model_reasoning_effort` from its own `config.toml`. The menu shows which model that currently is, and the button reads `默认 · <model>`.
+- Picking a model sends it with every turn of the task. Its effort row starts at **默认**, which leaves the effort to Codex (your configured effort, or the model's own default); pick 低 / 中 / 高 / 超高 / 最大 / 极限 to set it.
+- The choice applies to new tasks and is remembered. Follow-ups keep the model of their conversation, and the button shows it read-only.
 
 On Windows, closing the window hides Longwatch to the tray. Quitting asks for confirmation while tasks are running or queued, because they stop and do not resume by themselves.
 
@@ -140,11 +152,8 @@ These have no switch in the window. Edit them while Longwatch is closed.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `retryPolicy.baseDelaySecs` | `30` | First backoff delay for ordinary transient failures (minimum 15). |
-| `retryPolicy.multiplier` | `1.7` | Growth factor between attempts. |
-| `retryPolicy.maxDelaySecs` | `600` | Longest backoff delay. |
-| `retryPolicy.jitterRatio` | `0.15` | Random spread of ± this fraction (0–0.5). |
-| `retryPolicy.highDemandDelaySecs` | `10` | Re-queue interval after a peak-load notice (1–300). |
+| `defaultModel` | `null` | Model for new tasks, set by the model button. `null` follows your Codex config. |
+| `defaultReasoningEffort` | `null` | Reasoning effort for new tasks. `null` leaves it to Codex. |
 | `retryPolicy.wakeDelaySecs` | `60` | Minimum wait after the system wakes (minimum 60). |
 | `retryPolicy.maxEmptyReplies` | `5` | Empty “successful” replies tolerated before pausing. |
 | `turnTimeoutSecs` | `1800` | A turn that runs longer than this is interrupted and retried (minimum 60). |
@@ -174,13 +183,17 @@ Longwatch starts the official Codex CLI as `codex app-server --listen stdio://` 
 initialize                 clientInfo + capabilities (experimentalApi, notification opt-outs)
 thread/start               threadSource "user"
 thread/resume              excludeTurns + initialTurnsPage (only the latest turn)
-turn/start                 text input tagged with a clientUserMessageId
+turn/start                 text input tagged with a clientUserMessageId; model and effort when chosen
+model/list                 the models offered in the model menu (every page)
+config/read                the model and effort your Codex config selects
 item/agentMessage/delta    streaming preview
 item/completed             authoritative message item
 turn/completed             the point where the outcome is decided
 thread/items/list          re-reads a final reply missed while disconnected
 turn/interrupt             pause, stop, or timeout
 ```
+
+Once the Codex CLI is found at launch, Longwatch starts a short-lived app-server just for `model/list` and `config/read`, the requests the official app makes for its own model picker.
 
 Interactive server requests, such as approvals for commands or file changes, extra permissions, tool input and MCP elicitation, receive the same **decline** the official clients send. Longwatch never approves anything on your behalf; Codex sees an ordinary refusal and carries on.
 
@@ -196,7 +209,7 @@ The risky moment is between sending `turn/start` and receiving its acknowledgeme
 4. Clear the marker once a turn ID is acknowledged or the thread has been reconciled.
 5. After a restart, call `thread/resume` before anything else is sent.
 6. If the latest turn carries our `clientUserMessageId`, adopt its real state. If it carries a different one, the request never arrived and is sent again, rather than mistaking an older answer for this one.
-7. If the outcome still cannot be proven, wait in a normal backoff instead of resending at once.
+7. If the outcome still cannot be proven, the request goes back through the normal retry path, which resumes and checks the thread again first, instead of being resent on the spot.
 
 If that critical state cannot be written to disk, Longwatch pauses **before** the request leaves the process.
 
@@ -205,26 +218,16 @@ If that critical state cannot be written to disk, Longwatch pauses **before** th
 | Outcome | What Longwatch does |
 | --- | --- |
 | Codex reports `willRetry = true` | Leaves the turn to Codex's own retry; sends nothing extra |
-| Peak-load (“high demand”) notice | Re-queues every ~10 s, without a red retry alert |
-| Codex's internal retries exhausted | Starts the next outer attempt after a short settling delay |
-| HTTP 429 / 502 / 503 / 504, overload text, lost process or stream | Backs off conservatively and retries |
-| Successful but empty reply | Retries up to `maxEmptyReplies` times |
+| Peak-load (“high demand”) notice | Sends again right away, without a retry alert |
+| Codex's internal retries exhausted | Sends again right away |
+| HTTP 429 / 502 / 503 / 504, overload text, lost process or stream | Sends again right away; a lost app-server is restarted right away |
+| Successful but empty reply | Sends again right away, up to `maxEmptyReplies` times |
 | Authentication, quota, policy, or configuration error | Pauses for you |
 | Broken protocol invariant | Stops with `FatalError` |
 
-Ordinary transient failures use:
+There is no growing backoff: every retry goes out as soon as the failure is known. The one rule is that two attempts of the same task start at least 2 seconds apart, so a request that fails the instant it is sent cannot turn into a tight loop. When Codex retries a capacity error itself (about five reconnects, 10–12 seconds apart), Longwatch leaves the turn alone and sends again the moment Codex gives up.
 
-```text
-delay(n) = min(30 s × 1.7^(n-1), 10 min) × random(0.85 … 1.15), never below 15 s
-```
-
-Peak-load notices use a fixed, human-like cadence instead:
-
-```text
-delay = 10 s × random(0.8 … 1.2)
-```
-
-Codex already retries capacity errors internally (five reconnects about 10–12 seconds apart). The outer queue keeps that rhythm, so after Codex gives up it re-queues roughly every ten seconds, much like a person pressing send again after reading the error, and never in a tight loop. If the app-server process itself drops, reconnects wait 5 s, then 15 s, then 60 s.
+The only longer wait is after the computer wakes from sleep: at least 60 seconds, while the network comes back.
 
 ### What is stored, and where
 
@@ -255,7 +258,10 @@ Typical locations are `%APPDATA%\Longwatch\config` on Windows, `~/Library/Applic
 No. Each conversation has at most one active turn, and the [write-ahead protocol](#never-sending-the-same-task-twice) checks with Codex after any crash before it sends again.
 
 **Does it get around rate limits or quotas?**\
-No. It waits and retries on a conservative schedule. Quota, authentication and policy errors pause the task until you deal with them.
+No. It resends right away, but never starts two attempts of a task less than 2 seconds apart, and quota, authentication and policy errors pause the task until you deal with them.
+
+**Which model does a task use?**\
+The one on the model button when you add the task. By default that is **跟随 Codex 设置**: Longwatch sends no model, and Codex uses the `model` and `model_reasoning_effort` in its `config.toml`. Follow-ups keep their conversation's model.
 
 **How do I silence the completion alarm?**\
 Click **查看** (View) or close the notification. To get quiet notifications instead, turn off **完成提示音** in Settings.
@@ -324,7 +330,7 @@ GPUI desktop shell (src/ui.rs)
         ▼
 Multi-session scheduler ── FIFO waiting queue
         │ 1–8 independent lanes
-        ├── QueueRuntime ── QueueMachine ── classifier / backoff / wake detector
+        ├── QueueRuntime ── QueueMachine ── classifier / retry spacing / wake detector
         │         └── codex app-server process ── conversation 1
         └── QueueRuntime ── QueueMachine
                   └── codex app-server process ── conversation N
@@ -336,7 +342,7 @@ Multi-session scheduler ── FIFO waiting queue
 | `src/queue.rs` | Deterministic queue state machine and its invariants |
 | `src/app_server.rs` | Codex app-server lifecycle, handshake and JSON-RPC transport |
 | `src/classifier.rs` | Success, retry and pause classification |
-| `src/backoff.rs` | Backoff, jitter, attempt ledger and wake detection |
+| `src/backoff.rs` | Retry spacing, attempt ledger and wake detection |
 | `src/config.rs` | Versioned config and state documents, migration, atomic writes |
 | `src/ui.rs` | The GPUI interface |
 | `crates/gpui_platform` | Notifications, tray, opening results, alerts and other OS integration |

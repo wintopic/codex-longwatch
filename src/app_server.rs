@@ -31,8 +31,8 @@ use crate::{
     classifier::TurnError,
     config::ClientIdentity,
     transport::{
-        CodexTransport, RestoredTurn, StartedTurn, ThreadSession, TransportError, TransportEvent,
-        TransportKind, TransportStatus, TurnStatus,
+        CodexModel, CodexTransport, ModelCatalog, RestoredTurn, StartedTurn, ThreadSession,
+        TransportError, TransportEvent, TransportKind, TransportStatus, TurnStatus,
     },
 };
 
@@ -149,6 +149,8 @@ pub struct AppServerTransport {
     server_agent: Option<String>,
     hide_window: bool,
     identity: ClientIdentity,
+    model: Option<String>,
+    effort: Option<String>,
     environment: Vec<(OsString, OsString)>,
     completed_messages: CompletedMessages,
 }
@@ -179,6 +181,8 @@ impl AppServerTransport {
             server_agent: None,
             hide_window: false,
             identity: ClientIdentity::default(),
+            model: None,
+            effort: None,
             environment: Vec::new(),
             completed_messages: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -423,6 +427,66 @@ impl AppServerTransport {
             }
         }
     }
+
+    /// The models `model/list` offers (every page), plus the model and
+    /// effort the user's Codex config picks when a turn names neither.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport is not connected or `model/list`
+    /// fails. A failing `config/read` only leaves the configured default out.
+    pub async fn list_models(&mut self) -> Result<ModelCatalog, TransportError> {
+        const MAX_PAGES: usize = 10;
+        if !self.connected {
+            return Err(TransportError::NotConnected);
+        }
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let params = cursor
+                .as_ref()
+                .map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
+            let page = self.request("model/list", params).await?;
+            models.extend(
+                page.get("data")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(parse_model),
+            );
+            cursor = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let config = match self
+            .request("config/read", json!({"includeLayers": false}))
+            .await
+        {
+            Ok(response) => response.get("config").cloned(),
+            Err(error) => {
+                debug!(%error, "无法读取 Codex 配置中的默认模型");
+                None
+            }
+        };
+        let configured = |key: &str| {
+            config
+                .as_ref()
+                .and_then(|config| config.get(key))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        Ok(ModelCatalog {
+            models,
+            configured_model: configured("model"),
+            configured_effort: configured("model_reasoning_effort"),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -433,6 +497,11 @@ impl CodexTransport for AppServerTransport {
 
     fn set_client_identity(&mut self, identity: ClientIdentity) {
         self.identity = identity;
+    }
+
+    fn set_model(&mut self, model: Option<&str>, effort: Option<&str>) {
+        self.model = model.map(str::to_owned);
+        self.effort = effort.map(str::to_owned);
     }
 
     fn status(&self) -> TransportStatus {
@@ -588,7 +657,14 @@ impl CodexTransport for AppServerTransport {
         let response = self
             .request(
                 "turn/start",
-                turn_start_params(thread_id, prompt, cwd, client_message_id),
+                turn_start_params(
+                    thread_id,
+                    prompt,
+                    cwd,
+                    client_message_id,
+                    self.model.as_deref(),
+                    self.effort.as_deref(),
+                ),
             )
             .await?;
         let turn_id = response
@@ -751,11 +827,15 @@ fn thread_resume_params(thread_id: &str, cwd: Option<&Path>) -> Value {
     params
 }
 
+/// `model` and `effort` stick to the thread for later turns as well, exactly
+/// like a choice made in the official model picker.
 fn turn_start_params(
     thread_id: &str,
     prompt: &str,
     cwd: Option<&Path>,
     client_message_id: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
 ) -> Value {
     let mut params = json!({
         "threadId": thread_id,
@@ -765,7 +845,64 @@ fn turn_start_params(
     if let Some(cwd) = cwd {
         params["cwd"] = Value::from(cwd.to_string_lossy().into_owned());
     }
+    if let Some(model) = model {
+        params["model"] = Value::from(model);
+    }
+    if let Some(effort) = effort {
+        params["effort"] = Value::from(effort);
+    }
     params
+}
+
+/// One `model/list` entry; hidden models stay out of the picker, as in the
+/// official clients.
+fn parse_model(value: &Value) -> Option<CodexModel> {
+    if value.get("hidden").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    let model = text("model").or_else(|| text("id"))?;
+    Some(CodexModel {
+        display_name: text("displayName").unwrap_or_else(|| model.clone()),
+        description: text("description").unwrap_or_default(),
+        efforts: value
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|option| option.get("reasoningEffort").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect(),
+        default_effort: text("defaultReasoningEffort"),
+        is_default: value.get("isDefault").and_then(Value::as_bool) == Some(true),
+        model,
+    })
+}
+
+/// Start a short-lived app-server just to read the model catalog, so the
+/// picker works before any task has run.
+///
+/// # Errors
+///
+/// Returns an error when Codex cannot be started or `model/list` fails.
+pub async fn fetch_model_catalog(
+    codex_path: PathBuf,
+    identity: ClientIdentity,
+) -> Result<ModelCatalog, TransportError> {
+    let mut transport = AppServerTransport::new(codex_path)
+        .with_hidden_window(true)
+        .with_client_identity(identity);
+    transport.connect().await?;
+    let catalog = transport.list_models().await;
+    transport.shutdown().await;
+    catalog
 }
 
 /// The "decline" reply for every interactive request the app-server may send,
@@ -1284,6 +1421,44 @@ mod tests {
     }
 
     #[test]
+    fn model_entries_keep_what_the_picker_needs_and_drop_hidden_ones() {
+        let entry = json!({
+            "id": "gpt-6.1-sol",
+            "model": "gpt-6.1-sol",
+            "displayName": "GPT-6.1-Sol",
+            "description": "Latest workhorse model for coding and everyday work.",
+            "hidden": false,
+            "isDefault": true,
+            "defaultReasoningEffort": "low",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "low", "description": "Fast"},
+                {"reasoningEffort": "high", "description": "Deep"}
+            ]
+        });
+        assert_eq!(
+            parse_model(&entry),
+            Some(CodexModel {
+                model: "gpt-6.1-sol".into(),
+                display_name: "GPT-6.1-Sol".into(),
+                description: "Latest workhorse model for coding and everyday work.".into(),
+                efforts: vec!["low".into(), "high".into()],
+                default_effort: Some("low".into()),
+                is_default: true,
+            })
+        );
+
+        let mut hidden = entry.clone();
+        hidden["hidden"] = json!(true);
+        assert_eq!(parse_model(&hidden), None);
+
+        let bare = json!({"id": "custom-model"});
+        let parsed = parse_model(&bare).unwrap();
+        assert_eq!(parsed.model, "custom-model");
+        assert_eq!(parsed.display_name, "custom-model");
+        assert_eq!(parsed.efforts, Vec::<String>::new());
+    }
+
+    #[test]
     fn thread_and_turn_requests_use_the_official_shapes() {
         assert_eq!(thread_start_params(None), json!({"threadSource": "user"}));
         assert_eq!(
@@ -1291,7 +1466,7 @@ mod tests {
             "C:/work"
         );
 
-        let turn = turn_start_params("th", "do it", None, "client-1");
+        let turn = turn_start_params("th", "do it", None, "client-1", None, None);
         assert_eq!(
             turn,
             json!({
@@ -1300,6 +1475,16 @@ mod tests {
                 "clientUserMessageId": "client-1"
             })
         );
+        let chosen = turn_start_params(
+            "th",
+            "do it",
+            None,
+            "client-1",
+            Some("gpt-6.1-sol"),
+            Some("high"),
+        );
+        assert_eq!(chosen["model"], "gpt-6.1-sol");
+        assert_eq!(chosen["effort"], "high");
 
         let resume = thread_resume_params("th", None);
         assert_eq!(resume["excludeTurns"], true);
