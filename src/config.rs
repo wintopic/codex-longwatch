@@ -14,7 +14,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::{
-    backoff::{ABSOLUTE_MIN_INTERVAL_SECS, AttemptLedger, RetryPolicy},
+    backoff::{AttemptLedger, RetryPolicy},
     queue::{ConversationMessage, PendingMessage, QueuePhase},
 };
 
@@ -84,6 +84,15 @@ pub struct QueueConfig {
     /// Folder preselected for new tasks. Kept apart from the task's own
     /// `working_directory` so finishing a task never changes the default.
     pub default_working_directory: Option<PathBuf>,
+    /// Model of the current task; `None` lets the user's Codex config decide.
+    pub model: Option<String>,
+    /// Reasoning effort sent along with `model`.
+    pub reasoning_effort: Option<String>,
+    /// Model and effort preselected for new tasks, kept apart from the task's
+    /// own choice for the same reason as the default folder. `None` is
+    /// 跟随 Codex 设置: the model and effort in the user's Codex config.
+    pub default_model: Option<String>,
+    pub default_reasoning_effort: Option<String>,
     pub codex_path: PathBuf,
     pub failure_phrases: Vec<String>,
     pub full_screen_flash_enabled: bool,
@@ -106,6 +115,10 @@ impl Default for QueueConfig {
             auto_send_default_prompt: false,
             working_directory: None,
             default_working_directory: None,
+            model: None,
+            reasoning_effort: None,
+            default_model: None,
+            default_reasoning_effort: None,
             codex_path: PathBuf::from("codex"),
             failure_phrases: vec![
                 "Server overloaded; retry later.".into(),
@@ -467,8 +480,15 @@ fn migrate_config(mut value: Value) -> Result<QueueConfig, ConfigError> {
         object.remove("guiFallbackEnabled");
         remove_legacy_attempt_limits(object);
         migrate_default_prompt(object);
-        // An empty path means "no folder"; never hand Codex an empty cwd.
-        for key in ["workingDirectory", "defaultWorkingDirectory"] {
+        // An empty value means "none": never hand Codex an empty cwd or model.
+        for key in [
+            "workingDirectory",
+            "defaultWorkingDirectory",
+            "model",
+            "reasoningEffort",
+            "defaultModel",
+            "defaultReasoningEffort",
+        ] {
             if object
                 .get(key)
                 .and_then(Value::as_str)
@@ -496,18 +516,10 @@ fn migrate_config(mut value: Value) -> Result<QueueConfig, ConfigError> {
             if let Value::Object(object) = &mut value {
                 object.insert("version".into(), Value::from(CONFIG_VERSION));
                 append_current_high_demand_phrase(object);
-                if let Some(interval) = object.remove("retryIntervalSeconds") {
-                    let policy = object
-                        .entry("retryPolicy")
-                        .or_insert_with(|| Value::Object(Default::default()));
-                    if let (Value::Object(policy), Some(interval)) = (policy, interval.as_u64()) {
-                        policy.insert(
-                            "baseDelaySecs".into(),
-                            Value::from(interval.max(ABSOLUTE_MIN_INTERVAL_SECS)),
-                        );
-                    }
-                }
-                migrate_default_retry_delay(object);
+                // Failed attempts are retried right away now, so the old
+                // fixed interval has nothing left to configure.
+                object.remove("retryIntervalSeconds");
+                migrate_default_empty_reply_limit(object);
             }
             serde_json::from_value(value).map_err(ConfigError::Json)
         }
@@ -515,7 +527,7 @@ fn migrate_config(mut value: Value) -> Result<QueueConfig, ConfigError> {
             if let Value::Object(object) = &mut value {
                 object.insert("version".into(), Value::from(CONFIG_VERSION));
                 append_current_high_demand_phrase(object);
-                migrate_default_retry_delay(object);
+                migrate_default_empty_reply_limit(object);
             }
             serde_json::from_value(value).map_err(ConfigError::Json)
         }
@@ -562,13 +574,10 @@ fn migrate_default_prompt(object: &mut serde_json::Map<String, Value>) {
     object.insert("defaultPrompt".into(), prompt);
 }
 
-fn migrate_default_retry_delay(object: &mut serde_json::Map<String, Value>) {
+fn migrate_default_empty_reply_limit(object: &mut serde_json::Map<String, Value>) {
     let Some(Value::Object(policy)) = object.get_mut("retryPolicy") else {
         return;
     };
-    if policy.get("baseDelaySecs").and_then(Value::as_u64) == Some(90) {
-        policy.insert("baseDelaySecs".into(), Value::from(30));
-    }
     if policy.get("maxEmptyReplies").and_then(Value::as_u64) == Some(3) {
         policy.insert("maxEmptyReplies".into(), Value::from(5));
     }
@@ -772,28 +781,79 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_interval_and_clamps_it() {
+    fn new_tasks_follow_the_codex_config_until_the_user_picks_a_model() {
+        // A config written before the model picker existed sends no model, so
+        // Codex keeps using the one in its own config.toml.
+        let older = migrate_config(json!({"version": CONFIG_VERSION, "prompt": "task"})).unwrap();
+        assert_eq!(older.default_model, None);
+        assert_eq!(older.default_reasoning_effort, None);
+        assert_eq!(older.model, None);
+
+        let chosen = QueueConfig {
+            default_model: Some("gpt-6-sol".into()),
+            default_reasoning_effort: Some("high".into()),
+            ..QueueConfig::default()
+        };
+        let reloaded = migrate_config(serde_json::to_value(&chosen).unwrap()).unwrap();
+        assert_eq!(reloaded.default_model.as_deref(), Some("gpt-6-sol"));
+        assert_eq!(reloaded.default_reasoning_effort.as_deref(), Some("high"));
+
+        // An empty value written by hand also means "follow Codex".
+        let blank = migrate_config(json!({
+            "version": CONFIG_VERSION,
+            "defaultModel": " ",
+            "defaultReasoningEffort": ""
+        }))
+        .unwrap();
+        assert_eq!(blank.default_model, None);
+        assert_eq!(blank.default_reasoning_effort, None);
+    }
+
+    #[test]
+    fn the_legacy_retry_interval_is_dropped() {
         let migrated = migrate_config(json!({
             "prompt": "real task",
             "retryIntervalSeconds": 12
         }))
         .unwrap();
         assert_eq!(migrated.version, CONFIG_VERSION);
-        assert_eq!(
-            migrated.retry_policy.base_delay_secs,
-            ABSOLUTE_MIN_INTERVAL_SECS
+        assert_eq!(migrated.retry_policy, RetryPolicy::default());
+        assert!(
+            serde_json::to_value(migrated)
+                .unwrap()
+                .get("retryIntervalSeconds")
+                .is_none()
         );
     }
 
     #[test]
-    fn v0_default_ninety_second_delay_runs_through_the_full_migration_chain() {
+    fn retired_backoff_settings_are_ignored_and_not_written_back() {
         let migrated = migrate_config(json!({
+            "version": CONFIG_VERSION,
             "prompt": "real task",
-            "retryIntervalSeconds": 90
+            "retryPolicy": {
+                "baseDelaySecs": 90,
+                "multiplier": 1.7,
+                "maxDelaySecs": 600,
+                "jitterRatio": 0.15,
+                "highDemandDelaySecs": 10,
+                "maxEmptyReplies": 4
+            }
         }))
         .unwrap();
 
-        assert_eq!(migrated.retry_policy.base_delay_secs, 30);
+        assert_eq!(migrated.retry_policy.max_empty_replies, 4);
+        let serialized = serde_json::to_value(migrated).unwrap();
+        let policy = serialized.get("retryPolicy").unwrap();
+        for retired in [
+            "baseDelaySecs",
+            "multiplier",
+            "maxDelaySecs",
+            "jitterRatio",
+            "highDemandDelaySecs",
+        ] {
+            assert!(policy.get(retired).is_none(), "{retired} was written back");
+        }
     }
 
     #[test]
@@ -837,7 +897,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(migrated.version, CONFIG_VERSION);
-        assert_eq!(migrated.retry_policy.base_delay_secs, 30);
         assert_eq!(migrated.retry_policy.max_empty_replies, 5);
         assert!(!migrated.full_screen_flash_enabled);
         assert!(migrated.audio_alert_enabled);

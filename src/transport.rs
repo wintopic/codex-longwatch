@@ -77,6 +77,49 @@ pub struct StartedTurn {
     pub id: String,
 }
 
+/// A model offered by `model/list`, reduced to what the model picker shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodexModel {
+    /// Sent as `model` on `turn/start`.
+    pub model: String,
+    pub display_name: String,
+    pub description: String,
+    /// Reasoning efforts the model accepts, in the order Codex lists them.
+    pub efforts: Vec<String>,
+    pub default_effort: Option<String>,
+    /// The catalog's own default, used when the Codex config names none.
+    pub is_default: bool,
+}
+
+/// What Codex reports about models: the picker list, plus the model and
+/// effort the user's Codex config selects when Longwatch sends neither.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelCatalog {
+    pub models: Vec<CodexModel>,
+    pub configured_model: Option<String>,
+    pub configured_effort: Option<String>,
+}
+
+impl ModelCatalog {
+    #[must_use]
+    pub fn find(&self, model: &str) -> Option<&CodexModel> {
+        self.models
+            .iter()
+            .find(|candidate| candidate.model == model)
+    }
+
+    /// The model Codex uses for a turn that names none.
+    #[must_use]
+    pub fn default_model(&self) -> Option<&str> {
+        self.configured_model.as_deref().or_else(|| {
+            self.models
+                .iter()
+                .find(|model| model.is_default)
+                .map(|model| model.model.as_str())
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TransportEvent {
     AgentMessageDelta {
@@ -139,6 +182,10 @@ pub trait CodexTransport: Send {
     fn set_app_server_window_hidden(&mut self, _hidden: bool) {}
     /// Identity presented on the next `connect`.
     fn set_client_identity(&mut self, _identity: ClientIdentity) {}
+    /// Model and reasoning effort sent with every following `turn/start`.
+    /// `None` keeps the thread's current choice, which for a new thread is
+    /// whatever the user's Codex config selects.
+    fn set_model(&mut self, _model: Option<&str>, _effort: Option<&str>) {}
     fn status(&self) -> TransportStatus {
         TransportStatus::default()
     }

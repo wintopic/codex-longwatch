@@ -1,86 +1,37 @@
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const ABSOLUTE_MIN_INTERVAL_SECS: u64 = 15;
 pub const MIN_WAKE_DELAY_SECS: u64 = 60;
-/// Codex 自己的容量重试大约每 10–12 秒一次（实测 5 次内部重连耗时约 58 秒）。
-/// 外层排队使用同样节奏，看起来就像有个人在看到报错后立刻又点了一次发送。
-pub const DEFAULT_HIGH_DEMAND_DELAY_SECS: u64 = 10;
-const MAX_HIGH_DEMAND_DELAY_SECS: u64 = 300;
+/// A failed attempt is retried right away. The only wait keeps two attempts
+/// of the same task at least this far apart, so a request that fails the
+/// moment it is sent cannot turn into a tight loop.
+pub const MIN_RETRY_SPACING: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RetryPolicy {
-    pub base_delay_secs: u64,
-    pub multiplier: f64,
-    pub max_delay_secs: u64,
-    pub jitter_ratio: f64,
     pub max_empty_replies: u8,
     pub wake_delay_secs: u64,
-    /// 高需求 / 限流之后重新排队的固定间隔。
-    pub high_demand_delay_secs: u64,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            base_delay_secs: 30,
-            multiplier: 1.7,
-            max_delay_secs: 10 * 60,
-            jitter_ratio: 0.15,
             max_empty_replies: 5,
             wake_delay_secs: MIN_WAKE_DELAY_SECS,
-            high_demand_delay_secs: DEFAULT_HIGH_DEMAND_DELAY_SECS,
         }
     }
 }
 
 impl RetryPolicy {
     pub fn validate(&self) -> Result<(), RetryPolicyError> {
-        if self.base_delay_secs < ABSOLUTE_MIN_INTERVAL_SECS {
-            return Err(RetryPolicyError::IntervalTooShort(self.base_delay_secs));
-        }
-        if self.max_delay_secs < self.base_delay_secs {
-            return Err(RetryPolicyError::MaxBelowBase);
-        }
-        if !self.multiplier.is_finite() || self.multiplier < 1.0 {
-            return Err(RetryPolicyError::InvalidMultiplier);
-        }
-        if !self.jitter_ratio.is_finite() || !(0.0..=0.5).contains(&self.jitter_ratio) {
-            return Err(RetryPolicyError::InvalidJitter);
-        }
         if self.wake_delay_secs < MIN_WAKE_DELAY_SECS {
             return Err(RetryPolicyError::WakeDelayTooShort);
         }
-        if !(1..=MAX_HIGH_DEMAND_DELAY_SECS).contains(&self.high_demand_delay_secs) {
-            return Err(RetryPolicyError::InvalidHighDemandDelay(
-                self.high_demand_delay_secs,
-            ));
-        }
         Ok(())
-    }
-
-    #[must_use]
-    pub fn delay_for<R: Rng + ?Sized>(&self, retry_number: u32, rng: &mut R) -> Duration {
-        let exponent = retry_number.saturating_sub(1) as i32;
-        let raw = (self.base_delay_secs as f64 * self.multiplier.powi(exponent))
-            .min(self.max_delay_secs as f64);
-        let jitter = rng.random_range(-self.jitter_ratio..=self.jitter_ratio);
-        let jittered = (raw * (1.0 + jitter)).round();
-        let floor = ABSOLUTE_MIN_INTERVAL_SECS as f64;
-        Duration::from_secs(jittered.max(floor) as u64)
-    }
-
-    /// 固定的"再排一次队"间隔，只做小幅抖动，避免和线上重试潮同步。
-    #[must_use]
-    pub fn high_demand_delay<R: Rng + ?Sized>(&self, rng: &mut R) -> Duration {
-        let base = self.high_demand_delay_secs.max(1) as f64;
-        let jitter = rng.random_range(-0.2_f64..=0.2_f64);
-        Duration::from_secs((base * (1.0 + jitter)).round().max(1.0) as u64)
     }
 
     #[must_use]
@@ -89,20 +40,19 @@ impl RetryPolicy {
     }
 }
 
-#[derive(Debug, Error, PartialEq)]
+/// How long to wait before retrying an attempt that began at `started`:
+/// nothing, unless that attempt is younger than [`MIN_RETRY_SPACING`].
+#[must_use]
+pub fn retry_delay(started: Option<Instant>, now: Instant) -> Duration {
+    started.map_or(Duration::ZERO, |started| {
+        MIN_RETRY_SPACING.saturating_sub(now.saturating_duration_since(started))
+    })
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum RetryPolicyError {
-    #[error("重试间隔 {0} 秒低于 15 秒安全下限")]
-    IntervalTooShort(u64),
-    #[error("最大重试间隔不能小于初始间隔")]
-    MaxBelowBase,
-    #[error("重试倍率必须是大于或等于 1.0 的有限数值")]
-    InvalidMultiplier,
-    #[error("抖动比例必须是 0 到 0.5 之间的有限数值")]
-    InvalidJitter,
     #[error("系统唤醒后的等待时间不能少于 60 秒")]
     WakeDelayTooShort,
-    #[error("高需求重试间隔 {0} 秒必须在 1 到 300 秒之间")]
-    InvalidHighDemandDelay(u64),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,42 +111,41 @@ impl WakeDetector {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
-    use rand::SeedableRng;
-    use rand_chacha::ChaCha8Rng;
 
     use super::*;
 
     #[test]
-    fn default_backoff_is_bounded_and_jittered() {
-        let policy = RetryPolicy::default();
-        let mut rng = ChaCha8Rng::seed_from_u64(7);
-        let first = policy.delay_for(1, &mut rng).as_secs();
-        assert!((25..=35).contains(&first));
-
-        let far_future = policy.delay_for(99, &mut rng).as_secs();
-        assert!((510..=690).contains(&far_future));
+    fn a_retry_never_waits_once_the_attempt_has_run_for_a_while() {
+        let now = Instant::now();
+        assert_eq!(retry_delay(None, now), Duration::ZERO);
+        assert_eq!(
+            retry_delay(Some(now), now + Duration::from_secs(60)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            retry_delay(Some(now), now + MIN_RETRY_SPACING),
+            Duration::ZERO
+        );
     }
 
     #[test]
-    fn high_demand_delay_matches_the_official_retry_cadence() {
-        let policy = RetryPolicy::default();
-        let mut rng = ChaCha8Rng::seed_from_u64(11);
-        for _ in 0..20 {
-            let seconds = policy.high_demand_delay(&mut rng).as_secs();
-            assert!((8..=12).contains(&seconds), "unexpected delay {seconds}s");
-        }
+    fn an_instant_failure_waits_out_the_rest_of_the_spacing() {
+        let now = Instant::now();
+        assert_eq!(retry_delay(Some(now), now), MIN_RETRY_SPACING);
+        assert_eq!(
+            retry_delay(Some(now), now + Duration::from_millis(500)),
+            Duration::from_millis(1500)
+        );
     }
 
     #[test]
-    fn custom_interval_cannot_drop_below_fifteen_seconds() {
+    fn wake_delay_cannot_drop_below_sixty_seconds() {
         let policy = RetryPolicy {
-            base_delay_secs: 14,
+            wake_delay_secs: 59,
             ..RetryPolicy::default()
         };
-        assert_eq!(
-            policy.validate(),
-            Err(RetryPolicyError::IntervalTooShort(14))
-        );
+        assert_eq!(policy.validate(), Err(RetryPolicyError::WakeDelayTooShort));
+        assert!(RetryPolicy::default().validate().is_ok());
     }
 
     #[test]

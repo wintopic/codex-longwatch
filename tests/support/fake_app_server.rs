@@ -86,9 +86,37 @@ fn main() {
                     json!({"thread": {"id": "thread-1", "turns": restored}}),
                 );
             }
+            "model/list" => {
+                // Two pages, with a hidden model the picker must leave out.
+                let page = if message["params"]["cursor"] == "page-2" {
+                    json!({"data": [fake_model("fake-model-b", "Fake B", false)], "nextCursor": null})
+                } else {
+                    json!({
+                        "data": [
+                            fake_model("fake-model-a", "Fake A", false),
+                            fake_model("fake-hidden", "Hidden", true)
+                        ],
+                        "nextCursor": "page-2"
+                    })
+                };
+                respond(&mut stdout, id, page);
+            }
+            "config/read" => respond(
+                &mut stdout,
+                id,
+                json!({
+                    "config": {"model": "fake-model-b", "model_reasoning_effort": "high"},
+                    "origins": {},
+                    "layers": null
+                }),
+            ),
             "turn/start" => {
                 turns += 1;
                 let turn_id = format!("turn-{turns}");
+                if let Some(path) = env::var_os("LONGWATCH_FAKE_TURN_LOG") {
+                    fs::write(path, serde_json::to_vec(&message["params"]).unwrap())
+                        .expect("write turn/start log");
+                }
                 respond(
                     &mut stdout,
                     id,
@@ -185,6 +213,23 @@ fn main() {
             _ => {}
         }
     }
+}
+
+fn fake_model(model: &str, name: &str, hidden: bool) -> Value {
+    json!({
+        "id": model,
+        "model": model,
+        "displayName": name,
+        "description": format!("{name} for tests"),
+        "hidden": hidden,
+        "isDefault": model == "fake-model-a",
+        "defaultReasoningEffort": "medium",
+        "supportedReasoningEfforts": [
+            {"reasoningEffort": "low", "description": "Fast"},
+            {"reasoningEffort": "medium", "description": "Balanced"},
+            {"reasoningEffort": "high", "description": "Deep"}
+        ]
+    })
 }
 
 fn completed_turn(id: &str, text: &str) -> Value {

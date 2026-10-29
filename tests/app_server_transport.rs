@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use codex_longwatch::{
-    app_server::AppServerTransport,
+    app_server::{AppServerTransport, fetch_model_catalog},
     config::{ClientIdentity, PersistedQueueState, QueueConfig},
     queue::QueuePhase,
     runtime::{RuntimeCommand, spawn_runtime},
@@ -76,11 +76,10 @@ async fn the_same_transport_can_reconnect_with_fresh_rpc_state() {
 
 #[tokio::test]
 async fn completed_item_stops_the_runtime_without_scheduling_an_empty_reply_retry() {
-    let mut config = QueueConfig {
+    let config = QueueConfig {
         prompt: "real task".into(),
         ..QueueConfig::default()
     };
-    config.retry_policy.base_delay_secs = 60;
     let runtime = spawn_runtime(
         fake_transport("completed_item_only"),
         config,
@@ -361,4 +360,111 @@ async fn non_desktop_identities_drop_an_inherited_originator_override() {
     assert_eq!(record["params"]["clientInfo"]["name"], "codex_cli_rs");
     assert!(record["originatorOverride"].is_null());
     transport.shutdown().await;
+}
+
+#[tokio::test]
+async fn model_list_reads_every_page_and_the_configured_default() {
+    let mut transport = fake_transport("success");
+    transport.connect().await.unwrap();
+
+    let catalog = transport.list_models().await.unwrap();
+
+    let models: Vec<_> = catalog
+        .models
+        .iter()
+        .map(|model| model.model.as_str())
+        .collect();
+    assert_eq!(models, ["fake-model-a", "fake-model-b"]);
+    assert_eq!(catalog.models[0].display_name, "Fake A");
+    assert_eq!(catalog.models[0].efforts, ["low", "medium", "high"]);
+    assert_eq!(catalog.models[0].default_effort.as_deref(), Some("medium"));
+    assert_eq!(catalog.configured_model.as_deref(), Some("fake-model-b"));
+    assert_eq!(catalog.configured_effort.as_deref(), Some("high"));
+    // The user's Codex config wins over the catalog's own default.
+    assert_eq!(catalog.default_model(), Some("fake-model-b"));
+    transport.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_model_catalog_can_be_fetched_before_any_task_runs() {
+    let catalog = fetch_model_catalog(
+        PathBuf::from(env!("CARGO_BIN_EXE_fake-codex-app-server")),
+        ClientIdentity::OfficialDesktop,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(catalog.models.len(), 2);
+    assert!(catalog.find("fake-model-b").is_some());
+    assert!(catalog.find("fake-hidden").is_none());
+}
+
+#[tokio::test]
+async fn turn_start_carries_the_selected_model_and_effort() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("turn-start.json");
+    let mut transport =
+        fake_transport("completed_item_only").with_env("LONGWATCH_FAKE_TURN_LOG", log.as_os_str());
+    transport.connect().await.unwrap();
+    let thread = transport.start_thread(None).await.unwrap();
+    let read_log =
+        || -> serde_json::Value { serde_json::from_slice(&std::fs::read(&log).unwrap()).unwrap() };
+
+    transport
+        .start_turn(&thread.id, "real task", None, "first-message")
+        .await
+        .unwrap();
+    let params = read_log();
+    assert!(params.get("model").is_none());
+    assert!(params.get("effort").is_none());
+
+    transport.set_model(Some("fake-model-b"), Some("high"));
+    transport
+        .start_turn(&thread.id, "real task", None, "second-message")
+        .await
+        .unwrap();
+    let params = read_log();
+    assert_eq!(params["model"], "fake-model-b");
+    assert_eq!(params["effort"], "high");
+    transport.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_runtime_sends_the_task_model_with_its_turns() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("turn-start.json");
+    let config = QueueConfig {
+        prompt: "real task".into(),
+        model: Some("fake-model-b".into()),
+        reasoning_effort: Some("high".into()),
+        ..QueueConfig::default()
+    };
+    let runtime = spawn_runtime(
+        fake_transport("completed_item_only").with_env("LONGWATCH_FAKE_TURN_LOG", log.as_os_str()),
+        config,
+        PersistedQueueState::default(),
+        None,
+    );
+    let mut snapshots = runtime.snapshot();
+    runtime.send(RuntimeCommand::Start).await.unwrap();
+
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            snapshots.changed().await.unwrap();
+            let snapshot = snapshots.borrow().clone();
+            if snapshot.phase == QueuePhase::Success {
+                break snapshot;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(snapshot.session_model.as_deref(), Some("fake-model-b"));
+    assert_eq!(snapshot.session_reasoning_effort.as_deref(), Some("high"));
+    let params: serde_json::Value = serde_json::from_slice(&std::fs::read(&log).unwrap()).unwrap();
+    assert_eq!(params["model"], "fake-model-b");
+    assert_eq!(params["effort"], "high");
+    runtime.send(RuntimeCommand::Shutdown).await.unwrap();
+    runtime.join().await.unwrap();
 }
